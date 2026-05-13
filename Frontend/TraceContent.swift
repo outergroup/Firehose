@@ -93,6 +93,39 @@ private struct TraceEvent {
     let detail: String
 }
 
+private struct ProcessTimelineResponse {
+    let captureStart: Double
+    let captureEnd: Double
+    let processCount: Int
+    let eventCount: UInt64
+    let processes: [TimelineProcess]
+}
+
+private struct TimelineProcess {
+    let pid: Int
+    let ppid: Int
+    let process: String
+    let firstTimestamp: Double
+    let startTimestamp: Double
+    let endTimestamp: Double
+    let lastTimestamp: Double
+    let eventCount: UInt64
+    let openAtStart: Bool
+    let isRunning: Bool
+}
+
+private struct TimelineProcessRow {
+    let process: TimelineProcess
+    let level: Int
+}
+
+private struct EventPositionResponse {
+    let found: Bool
+    let index: Int
+    let eventID: UInt64
+    let timestamp: Double
+}
+
 private enum FilterColumn: String, CaseIterable {
     case time
     case event
@@ -239,6 +272,90 @@ private func decodeTraceEventResponse(_ data: Data) throws -> TraceEventResponse
                               events: events)
 }
 
+private func decodeProcessTimelineResponse(_ data: Data) throws -> ProcessTimelineResponse {
+    let magic = try data.traceUInt32(at: 0)
+    let version = try data.traceUInt16(at: 4)
+    let headerSize = Int(try data.traceUInt16(at: 6))
+    let captureStart = try data.traceDouble(at: 8)
+    let captureEnd = try data.traceDouble(at: 16)
+    let processCount = Int(try data.traceUInt32(at: 24))
+    let recordSize = Int(try data.traceUInt32(at: 28))
+    let eventCount = try data.traceUInt64(at: 32)
+    let totalProcessCountValue = headerSize >= 48 ? try data.traceUInt64(at: 40) : UInt64(processCount)
+
+    guard magic == 0x5043_5254,
+          version == 1,
+          headerSize >= 48,
+          recordSize >= 64,
+          totalProcessCountValue <= UInt64(Int.max),
+          headerSize <= data.count,
+          processCount <= (data.count - headerSize) / recordSize else {
+        throw TraceEventDecodeError.invalidFormat
+    }
+    let totalProcessCount = Int(totalProcessCountValue)
+
+    var processes: [TimelineProcess] = []
+    processes.reserveCapacity(processCount)
+    for index in 0..<processCount {
+        let offset = headerSize + index * recordSize
+        let flags = try data.traceUInt32(at: offset + 48)
+        processes.append(TimelineProcess(pid: Int(try data.traceInt32(at: offset + 0)),
+                                         ppid: Int(try data.traceInt32(at: offset + 4)),
+                                         process: try data.traceStringRef32(at: offset + 52),
+                                         firstTimestamp: try data.traceDouble(at: offset + 8),
+                                         startTimestamp: try data.traceDouble(at: offset + 16),
+                                         endTimestamp: try data.traceDouble(at: offset + 24),
+                                         lastTimestamp: try data.traceDouble(at: offset + 32),
+                                         eventCount: try data.traceUInt64(at: offset + 40),
+                                         openAtStart: (flags & 1) != 0,
+                                         isRunning: (flags & 2) != 0))
+    }
+
+    return ProcessTimelineResponse(captureStart: captureStart,
+                                   captureEnd: captureEnd,
+                                   processCount: totalProcessCount,
+                                   eventCount: eventCount,
+                                   processes: processes)
+}
+
+private func decodeEventPositionResponse(_ data: Data) throws -> EventPositionResponse {
+    let magic = try data.traceUInt32(at: 0)
+    let version = try data.traceUInt16(at: 4)
+    let headerSize = Int(try data.traceUInt16(at: 6))
+    let indexValue = try data.traceUInt64(at: 8)
+    let eventID = try data.traceUInt64(at: 16)
+    let timestamp = try data.traceDouble(at: 24)
+    let found = try data.traceUInt32(at: 32) != 0
+
+    guard magic == 0x504a_5254,
+          version == 1,
+          headerSize >= 40,
+          headerSize <= data.count,
+          (!found || indexValue <= UInt64(Int.max)) else {
+        throw TraceEventDecodeError.invalidFormat
+    }
+
+    return EventPositionResponse(found: found,
+                                 index: found ? Int(indexValue) : 0,
+                                 eventID: eventID,
+                                 timestamp: timestamp)
+}
+
+private func decodeClearLogResponse(_ data: Data) throws -> Bool {
+    let magic = try data.traceUInt32(at: 0)
+    let version = try data.traceUInt16(at: 4)
+    let headerSize = Int(try data.traceUInt16(at: 6))
+    let cleared = try data.traceUInt32(at: 8) != 0
+
+    guard magic == 0x434c_5254,
+          version == 1,
+          headerSize >= 16,
+          headerSize <= data.count else {
+        throw TraceEventDecodeError.invalidFormat
+    }
+    return cleared
+}
+
 @MainActor
 private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTextInputControllerDelegate {
     private static let filterFieldID = UUID(uuidString: "E626575E-5EF3-4B83-B394-942B0EA50814")!
@@ -252,6 +369,16 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         let process: CATextLayer
         let path: CATextLayer
         let detail: CATextLayer
+    }
+
+    private struct TimelineRowLayers {
+        let container: CALayer
+        let background: CALayer
+        let name: CATextLayer
+        let pid: CATextLayer
+        let events: CATextLayer
+        let barTrack: CALayer
+        let bar: CALayer
     }
 
     private let outerframeHost: OuterframeHost
@@ -273,12 +400,22 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     private let toolbarLayer = CALayer()
     private let pauseButtonLayer = CALayer()
     private let pauseButtonIconLayer = CALayer()
+    private let clearLogButtonLayer = CALayer()
+    private let clearLogButtonIconLayer = CALayer()
     private let headerLayer = CALayer()
     private let headerBorderLayer = CALayer()
     private let tableLayer = CALayer()
     private let rowsClipLayer = CALayer()
     private let scrollbarTrackLayer = CALayer()
     private let scrollbarThumbLayer = CALayer()
+    private let processTimelineLayer = CALayer()
+    private let processTimelineHeaderLayer = CALayer()
+    private let processTimelineTitleLayer = CATextLayer()
+    private let processTimelineRangeLayer = CATextLayer()
+    private let processTimelineRowsClipLayer = CALayer()
+    private let processTimelineEmptyLayer = CATextLayer()
+    private let processTimelineScrollbarTrackLayer = CALayer()
+    private let processTimelineScrollbarThumbLayer = CALayer()
     private let filterPillLayer = CALayer()
     private let filterPillTextLayer = CATextLayer()
     private let filterPanelLayer = CALayer()
@@ -292,15 +429,20 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     private var headerTextLayers: [CATextLayer] = []
     private var headerSeparatorLayers: [CALayer] = []
     private var rowLayers: [RowLayers] = []
+    private var timelineRowLayers: [TimelineRowLayers] = []
 
     private var didRegisterLayer = false
     private var currentSize = CGSize(width: 960, height: 640)
     private var apiEndpoint: URL?
+    private var processTimelineEndpoint: URL?
+    private var eventPositionEndpoint: URL?
     private var captureEndpoint: URL?
+    private var clearLogEndpoint: URL?
     private var urlSession: URLSession?
     private var pollTimer: Timer?
     private var inFlight = false
     private var pendingFetchAfterInFlight = false
+    private var logGeneration = 0
     private var lastRequestedStart = -1
     private var lastRequestedCount = -1
     private var lastRequestedTail = false
@@ -324,10 +466,24 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     private var filterClauses: [FilterClause] = []
     private var pendingCellFilterContext: CellFilterContext?
     private var isCapturePaused = false
+    private var processTimelineInFlight = false
+    private var lastProcessTimelinePollTime: CFTimeInterval = 0
+    private var processTimelineResponse: ProcessTimelineResponse?
+    private var processTimelineRows: [TimelineProcessRow] = []
+    private var processTimelineScrollOffset: CGFloat = 0
+    private var isDraggingProcessTimelineScrollbar = false
+    private var processTimelineScrollbarDragOffset: CGFloat = 0
 
     private let toolbarHeight: CGFloat = 58
     private let headerHeight: CGFloat = 30
     private let rowHeight: CGFloat = 26
+    private let processTimelineHeaderHeight: CGFloat = 28
+    private let processTimelineRowHeight: CGFloat = 22
+    private let processTimelineMinHeight: CGFloat = 132
+    private let processTimelineMaxHeight: CGFloat = 220
+    private let processTimelineNameWidth: CGFloat = 230
+    private let processTimelinePIDWidth: CGFloat = 66
+    private let processTimelineEventsWidth: CGFloat = 58
     private let horizontalInset: CGFloat = 18
     private let scrollbarWidth: CGFloat = 9
     private let scrollbarTrailingInset: CGFloat = 4
@@ -337,6 +493,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     private let minPrefetchRows = 120
     private let filterPillSize = CGSize(width: 260, height: 28)
     private let pauseButtonSize = CGSize(width: 28, height: 28)
+    private let clearLogButtonSize = CGSize(width: 28, height: 28)
     private let filterPanelSize = CGSize(width: 460, height: 238)
     private let filterValueFont = NSFont.systemFont(ofSize: 12, weight: .regular)
     private let filterCaretWidth: CGFloat = 1
@@ -377,11 +534,13 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             updateTextInputState()
             startPolling()
             fetchVisibleWindow(force: true)
+            fetchProcessTimeline(force: true)
 
         case .resizeContent(let size):
             currentSize = size
             resetScrollPrediction()
             clampScrollOffset()
+            clampProcessTimelineScrollOffset()
             updateLayout()
             fetchVisibleWindow(force: true)
 
@@ -390,8 +549,14 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             updateColors()
 
         case .scrollWheelEvent(let point, let delta, _, _, _, let hasPreciseScrollingDeltas):
-            guard rowsClipLayer.frame.contains(tableLayer.convert(point, from: rootLayer)) else { return }
             let multiplier = hasPreciseScrollingDeltas ? CGFloat(1) : rowHeight
+            if processTimelineRowsClipLayer.frame.contains(processTimelineLayer.convert(point, from: rootLayer)) {
+                processTimelineScrollOffset -= delta.y * multiplier
+                clampProcessTimelineScrollOffset()
+                updateLayout()
+                return
+            }
+            guard rowsClipLayer.frame.contains(tableLayer.convert(point, from: rootLayer)) else { return }
             scrollOffset -= delta.y * multiplier
             clampScrollOffset()
             recordScrollSample()
@@ -401,14 +566,21 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         case .mouseDown(let point, let modifierFlags, let clickCount):
             if !handleToolbarMouseDown(at: point),
                !handleFilterMouseDown(at: point, modifierFlags: modifierFlags, clickCount: clickCount) {
-                _ = handleScrollbarMouseDown(at: point)
+                if !handleProcessTimelineScrollbarMouseDown(at: point),
+                   !handleProcessTimelineMouseDown(at: point) {
+                    _ = handleScrollbarMouseDown(at: point)
+                }
             }
 
         case .mouseDragged(let point, _):
-            _ = handleScrollbarMouseDragged(to: point)
+            if !handleProcessTimelineScrollbarMouseDragged(to: point) {
+                _ = handleScrollbarMouseDragged(to: point)
+            }
 
         case .mouseUp(let point, _):
-            _ = handleScrollbarMouseUp(at: point)
+            if !handleProcessTimelineScrollbarMouseUp(at: point) {
+                _ = handleScrollbarMouseUp(at: point)
+            }
 
         case .rightMouseDown(let point, _, _):
             handleCellContextMenu(at: point)
@@ -471,7 +643,10 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     private func configureNetworking() {
         if let base = outerframeHost.pluginBaseURL() {
             apiEndpoint = URL(string: "/api/events", relativeTo: base)?.absoluteURL
+            processTimelineEndpoint = URL(string: "/api/processes", relativeTo: base)?.absoluteURL
+            eventPositionEndpoint = URL(string: "/api/event-position", relativeTo: base)?.absoluteURL
             captureEndpoint = URL(string: "/api/capture", relativeTo: base)?.absoluteURL
+            clearLogEndpoint = URL(string: "/api/clear", relativeTo: base)?.absoluteURL
         }
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 5
@@ -484,7 +659,13 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         stopPolling()
         pollTimer = Timer.scheduledTimer(withTimeInterval: 0.75, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.fetchVisibleWindow(force: true)
+                guard let self else { return }
+                self.fetchVisibleWindow(force: true)
+                let now = CACurrentMediaTime()
+                if now - self.lastProcessTimelinePollTime >= 3.0 {
+                    self.lastProcessTimelinePollTime = now
+                    self.fetchProcessTimeline(force: false)
+                }
             }
         }
     }
@@ -499,6 +680,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
 
         rootLayer.masksToBounds = true
         rootLayer.addSublayer(tableLayer)
+        rootLayer.addSublayer(processTimelineLayer)
         rootLayer.addSublayer(toolbarLayer)
         rootLayer.addSublayer(headerLayer)
         rootLayer.addSublayer(headerBorderLayer)
@@ -506,9 +688,18 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         toolbarLayer.addSublayer(statusLayer)
         toolbarLayer.addSublayer(pauseButtonLayer)
         pauseButtonLayer.addSublayer(pauseButtonIconLayer)
+        toolbarLayer.addSublayer(clearLogButtonLayer)
+        clearLogButtonLayer.addSublayer(clearLogButtonIconLayer)
         tableLayer.addSublayer(rowsClipLayer)
         tableLayer.addSublayer(scrollbarTrackLayer)
         scrollbarTrackLayer.addSublayer(scrollbarThumbLayer)
+        processTimelineLayer.addSublayer(processTimelineHeaderLayer)
+        processTimelineLayer.addSublayer(processTimelineRowsClipLayer)
+        processTimelineLayer.addSublayer(processTimelineScrollbarTrackLayer)
+        processTimelineHeaderLayer.addSublayer(processTimelineTitleLayer)
+        processTimelineHeaderLayer.addSublayer(processTimelineRangeLayer)
+        processTimelineRowsClipLayer.addSublayer(processTimelineEmptyLayer)
+        processTimelineScrollbarTrackLayer.addSublayer(processTimelineScrollbarThumbLayer)
         rootLayer.addSublayer(filterPillLayer)
         rootLayer.addSublayer(filterPanelLayer)
         filterPillLayer.addSublayer(filterPillTextLayer)
@@ -528,6 +719,26 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         pauseButtonLayer.masksToBounds = true
         pauseButtonIconLayer.contentsGravity = .resizeAspect
         pauseButtonIconLayer.contentsScale = 2
+        clearLogButtonLayer.cornerRadius = clearLogButtonSize.height / 2
+        clearLogButtonLayer.masksToBounds = true
+        clearLogButtonIconLayer.contentsGravity = .resizeAspect
+        clearLogButtonIconLayer.contentsScale = 2
+
+        processTimelineTitleLayer.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        processTimelineTitleLayer.fontSize = 12
+        processTimelineTitleLayer.contentsScale = 2
+        processTimelineTitleLayer.truncationMode = .end
+        processTimelineTitleLayer.string = "Processes"
+        processTimelineRangeLayer.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        processTimelineRangeLayer.fontSize = 11
+        processTimelineRangeLayer.contentsScale = 2
+        processTimelineRangeLayer.alignmentMode = .right
+        processTimelineRangeLayer.truncationMode = .end
+        processTimelineEmptyLayer.font = NSFont.systemFont(ofSize: 12, weight: .regular)
+        processTimelineEmptyLayer.fontSize = 12
+        processTimelineEmptyLayer.contentsScale = 2
+        processTimelineEmptyLayer.alignmentMode = .center
+        processTimelineEmptyLayer.string = "No process events yet"
 
         filterPillLayer.cornerRadius = 6
         filterPillLayer.borderWidth = 1
@@ -594,6 +805,9 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         scrollbarTrackLayer.cornerRadius = scrollbarWidth / 2
         scrollbarThumbLayer.cornerRadius = scrollbarWidth / 2
         rowsClipLayer.masksToBounds = true
+        processTimelineRowsClipLayer.masksToBounds = true
+        processTimelineScrollbarTrackLayer.cornerRadius = scrollbarWidth / 2
+        processTimelineScrollbarThumbLayer.cornerRadius = scrollbarWidth / 2
     }
 
     private func makeTextLayer(size: CGFloat,
@@ -640,6 +854,37 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         return row
     }
 
+    private func makeTimelineRowLayers() -> TimelineRowLayers {
+        let container = CALayer()
+        let background = CALayer()
+        let name = makeTextLayer(size: 12, weight: .regular)
+        let pid = makeTextLayer(size: 11, weight: .regular, alignment: .right)
+        let events = makeTextLayer(size: 11, weight: .regular, alignment: .right)
+        let barTrack = CALayer()
+        let bar = CALayer()
+
+        background.cornerRadius = 4
+        barTrack.cornerRadius = 2
+        bar.cornerRadius = 2
+        container.addSublayer(background)
+        container.addSublayer(name)
+        container.addSublayer(pid)
+        container.addSublayer(events)
+        container.addSublayer(barTrack)
+        container.addSublayer(bar)
+        processTimelineRowsClipLayer.addSublayer(container)
+
+        let row = TimelineRowLayers(container: container,
+                                    background: background,
+                                    name: name,
+                                    pid: pid,
+                                    events: events,
+                                    barTrack: barTrack,
+                                    bar: bar)
+        applyColors(to: row)
+        return row
+    }
+
     private func updateLayout() {
         withoutImplicitAnimations {
             let width = max(currentSize.width, 1)
@@ -651,11 +896,14 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                                         width: width,
                                         height: toolbarHeight)
 
-            let tableHeight = max(height - toolbarHeight, 1)
-            tableLayer.frame = CGRect(x: 0, y: 0, width: width, height: tableHeight)
+            let contentHeight = max(height - toolbarHeight, 1)
+            let timelineHeight = processTimelineHeight(for: contentHeight)
+            let tableHeight = max(contentHeight - timelineHeight, 1)
+            processTimelineLayer.frame = CGRect(x: 0, y: 0, width: width, height: timelineHeight)
+            tableLayer.frame = CGRect(x: 0, y: timelineHeight, width: width, height: tableHeight)
             let scrollbarX = width - scrollbarTrailingInset - scrollbarWidth
             headerLayer.frame = CGRect(x: horizontalInset,
-                                       y: tableHeight - headerHeight,
+                                       y: timelineHeight + tableHeight - headerHeight,
                                        width: max(scrollbarX - horizontalInset - 8, 1),
                                        height: headerHeight)
             let scale = max(headerLayer.contentsScale, 1)
@@ -677,10 +925,18 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             updateRowLayerCount()
             layoutRows()
             layoutScrollbar()
+            layoutProcessTimeline()
             layoutFilterUI()
             layoutToolbarTitle()
             updateStatusText()
         }
+    }
+
+    private func processTimelineHeight(for contentHeight: CGFloat) -> CGFloat {
+        guard contentHeight > 220 else {
+            return min(max(contentHeight * 0.36, 88), max(contentHeight - 96, 64))
+        }
+        return min(max(floor(contentHeight * 0.30), processTimelineMinHeight), processTimelineMaxHeight)
     }
 
     private func layoutToolbarTitle() {
@@ -708,7 +964,13 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                                        height: filterPillSize.height)
         filterPillTextLayer.frame = filterPillLayer.bounds.insetBy(dx: 10, dy: 7)
 
-        pauseButtonLayer.frame = CGRect(x: max(pillX - pauseButtonSize.width - 8, horizontalInset),
+        clearLogButtonLayer.frame = CGRect(x: max(pillX - clearLogButtonSize.width - 8, horizontalInset),
+                                           y: (toolbarHeight - clearLogButtonSize.height) / 2,
+                                           width: clearLogButtonSize.width,
+                                           height: clearLogButtonSize.height)
+        clearLogButtonIconLayer.frame = clearLogButtonLayer.bounds.insetBy(dx: 3, dy: 3)
+
+        pauseButtonLayer.frame = CGRect(x: max(clearLogButtonLayer.frame.minX - pauseButtonSize.width - 6, horizontalInset),
                                         y: (toolbarHeight - pauseButtonSize.height) / 2,
                                         width: pauseButtonSize.width,
                                         height: pauseButtonSize.height)
@@ -782,6 +1044,114 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         scrollbarThumbLayer.frame = CGRect(x: 0, y: y, width: scrollbarWidth, height: thumbHeight)
     }
 
+    private func layoutProcessTimeline() {
+        let bounds = processTimelineLayer.bounds
+        let scrollbarX = bounds.width - scrollbarTrailingInset - scrollbarWidth
+        processTimelineHeaderLayer.frame = CGRect(x: horizontalInset,
+                                                  y: bounds.height - processTimelineHeaderHeight,
+                                                  width: max(scrollbarX - horizontalInset - 8, 1),
+                                                  height: processTimelineHeaderHeight)
+        processTimelineTitleLayer.frame = CGRect(x: 0,
+                                                 y: 7,
+                                                 width: min(processTimelineNameWidth, processTimelineHeaderLayer.bounds.width * 0.45),
+                                                 height: 16)
+        processTimelineRangeLayer.frame = CGRect(x: processTimelineTitleLayer.frame.maxX + 8,
+                                                 y: 7,
+                                                 width: max(processTimelineHeaderLayer.bounds.width - processTimelineTitleLayer.frame.maxX - 8, 1),
+                                                 height: 16)
+        processTimelineRowsClipLayer.frame = CGRect(x: horizontalInset,
+                                                    y: 0,
+                                                    width: max(scrollbarX - horizontalInset - 8, 1),
+                                                    height: max(bounds.height - processTimelineHeaderHeight, 1))
+        processTimelineScrollbarTrackLayer.frame = CGRect(x: scrollbarX,
+                                                          y: 0,
+                                                          width: scrollbarWidth,
+                                                          height: processTimelineRowsClipLayer.bounds.height)
+        updateTimelineRowLayerCount()
+        layoutTimelineRows()
+        layoutProcessTimelineScrollbar()
+        updateProcessTimelineHeaderText()
+    }
+
+    private func layoutTimelineRows() {
+        let timelineWidth = max(processTimelineRowsClipLayer.bounds.width - processTimelineNameWidth - processTimelinePIDWidth - processTimelineEventsWidth - 24, 24)
+        let timelineX = processTimelineNameWidth + processTimelinePIDWidth + processTimelineEventsWidth + 18
+        let visibleStart = processTimelineVisibleStartIndex()
+        let startTime = processTimelineResponse?.captureStart ?? 0
+        let endTime = max(processTimelineResponse?.captureEnd ?? startTime, startTime + 0.001)
+        let duration = max(endTime - startTime, 0.001)
+
+        for (layerIndex, row) in timelineRowLayers.enumerated() {
+            let processIndex = visibleStart + layerIndex
+            guard processIndex < processTimelineRows.count else {
+                row.container.isHidden = true
+                continue
+            }
+
+            let item = processTimelineRows[processIndex]
+            let process = item.process
+            let y = processTimelineRowsClipLayer.bounds.height - CGFloat(layerIndex + 1) * processTimelineRowHeight
+            row.container.isHidden = false
+            row.container.frame = CGRect(x: 0,
+                                         y: y,
+                                         width: processTimelineRowsClipLayer.bounds.width,
+                                         height: processTimelineRowHeight)
+            row.background.frame = row.container.bounds.insetBy(dx: 0, dy: 1)
+            let indent = min(CGFloat(item.level) * 12, 72)
+            row.name.frame = CGRect(x: indent + 6, y: 4, width: max(processTimelineNameWidth - indent - 8, 1), height: 15)
+            row.pid.frame = CGRect(x: processTimelineNameWidth,
+                                   y: 4,
+                                   width: processTimelinePIDWidth,
+                                   height: 15)
+            row.events.frame = CGRect(x: processTimelineNameWidth + processTimelinePIDWidth + 6,
+                                      y: 4,
+                                      width: processTimelineEventsWidth,
+                                      height: 15)
+            row.barTrack.frame = CGRect(x: timelineX,
+                                        y: 9,
+                                        width: timelineWidth,
+                                        height: 4)
+
+            let rawStartX = CGFloat((process.startTimestamp - startTime) / duration) * timelineWidth
+            let rawEndX = CGFloat((process.endTimestamp - startTime) / duration) * timelineWidth
+            let startX = min(max(rawStartX, 0), timelineWidth)
+            let endX = min(max(rawEndX, startX), timelineWidth)
+            let barWidth = max(endX - startX, process.isRunning ? 3 : 4)
+            row.bar.frame = CGRect(x: timelineX + startX,
+                                   y: 7,
+                                   width: min(barWidth, max(timelineWidth - startX, 2)),
+                                   height: 8)
+            row.name.string = process.process.isEmpty ? "pid-\(process.pid)" : process.process
+            row.pid.string = String(process.pid)
+            row.events.string = formatCompactCount(process.eventCount)
+            row.background.opacity = processIndex % 2 == 0 ? 0.28 : 0
+            appearance?.performAsCurrentDrawingAppearance {
+                row.bar.backgroundColor = NSColor.systemGreen
+                    .withAlphaComponent(process.openAtStart ? 0.72 : 0.88)
+                    .cgColor
+            }
+        }
+
+        processTimelineEmptyLayer.isHidden = !processTimelineRows.isEmpty
+        processTimelineEmptyLayer.frame = processTimelineRowsClipLayer.bounds.insetBy(dx: 16, dy: max(processTimelineRowsClipLayer.bounds.height / 2 - 10, 0))
+    }
+
+    private func layoutProcessTimelineScrollbar() {
+        let viewportHeight = processTimelineRowsClipLayer.bounds.height
+        let contentHeight = CGFloat(processTimelineRows.count) * processTimelineRowHeight
+        let maxOffset = max(contentHeight - viewportHeight, 0)
+        processTimelineScrollbarTrackLayer.isHidden = maxOffset <= 0
+        if maxOffset <= 0 {
+            processTimelineScrollbarThumbLayer.frame = CGRect(x: 0, y: 0, width: scrollbarWidth, height: viewportHeight)
+            return
+        }
+
+        let thumbHeight = max((viewportHeight / contentHeight) * viewportHeight, 28)
+        let travel = max(viewportHeight - thumbHeight, 0)
+        let y = viewportHeight - thumbHeight - (processTimelineScrollOffset / maxOffset) * travel
+        processTimelineScrollbarThumbLayer.frame = CGRect(x: 0, y: y, width: scrollbarWidth, height: thumbHeight)
+    }
+
     private func handleScrollbarMouseDown(at point: CGPoint) -> Bool {
         guard !scrollbarTrackLayer.isHidden,
               maxScrollOffset() > 0 else {
@@ -824,13 +1194,75 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             .contains(scrollbarTrackLayer.convert(point, from: rootLayer))
     }
 
-    private func handleToolbarMouseDown(at point: CGPoint) -> Bool {
-        let toolbarPoint = toolbarLayer.convert(point, from: rootLayer)
-        guard pauseButtonLayer.frame.insetBy(dx: -4, dy: -4).contains(toolbarPoint) else {
+    private func handleProcessTimelineScrollbarMouseDown(at point: CGPoint) -> Bool {
+        guard !processTimelineScrollbarTrackLayer.isHidden,
+              maxProcessTimelineScrollOffset() > 0 else {
             return false
         }
-        setCapturePaused(!isCapturePaused)
+
+        let trackPoint = processTimelineScrollbarTrackLayer.convert(point, from: rootLayer)
+        let hitBounds = processTimelineScrollbarTrackLayer.bounds.insetBy(dx: -scrollbarHitSlop, dy: 0)
+        guard hitBounds.contains(trackPoint) else {
+            return false
+        }
+
+        let thumbHitFrame = processTimelineScrollbarThumbLayer.frame.insetBy(dx: -scrollbarHitSlop, dy: 0)
+        if thumbHitFrame.contains(trackPoint) {
+            isDraggingProcessTimelineScrollbar = true
+            processTimelineScrollbarDragOffset = min(max(trackPoint.y - processTimelineScrollbarThumbLayer.frame.minY, 0),
+                                                     processTimelineScrollbarThumbLayer.frame.height)
+            return true
+        }
+
+        let targetThumbY = trackPoint.y - processTimelineScrollbarThumbLayer.bounds.height * 0.5
+        setProcessTimelineScrollOffsetForScrollbarThumbY(targetThumbY)
+        isDraggingProcessTimelineScrollbar = true
+        processTimelineScrollbarDragOffset = processTimelineScrollbarThumbLayer.bounds.height * 0.5
         return true
+    }
+
+    private func handleProcessTimelineScrollbarMouseDragged(to point: CGPoint) -> Bool {
+        guard isDraggingProcessTimelineScrollbar else { return false }
+        let trackPoint = processTimelineScrollbarTrackLayer.convert(point, from: rootLayer)
+        setProcessTimelineScrollOffsetForScrollbarThumbY(trackPoint.y - processTimelineScrollbarDragOffset)
+        return true
+    }
+
+    private func handleProcessTimelineScrollbarMouseUp(at point: CGPoint) -> Bool {
+        let wasDragging = isDraggingProcessTimelineScrollbar
+        isDraggingProcessTimelineScrollbar = false
+        processTimelineScrollbarDragOffset = 0
+        return wasDragging && processTimelineScrollbarTrackLayer.bounds.insetBy(dx: -scrollbarHitSlop, dy: 0)
+            .contains(processTimelineScrollbarTrackLayer.convert(point, from: rootLayer))
+    }
+
+    private func handleProcessTimelineMouseDown(at point: CGPoint) -> Bool {
+        let timelinePoint = processTimelineRowsClipLayer.convert(point, from: rootLayer)
+        guard processTimelineRowsClipLayer.bounds.contains(timelinePoint) else {
+            return false
+        }
+
+        let rowFromTop = Int(floor((processTimelineRowsClipLayer.bounds.height - timelinePoint.y) / processTimelineRowHeight))
+        let processIndex = processTimelineVisibleStartIndex() + max(rowFromTop, 0)
+        guard processIndex >= 0, processIndex < processTimelineRows.count else {
+            return true
+        }
+
+        jumpToFirstEvent(for: processTimelineRows[processIndex].process.pid)
+        return true
+    }
+
+    private func handleToolbarMouseDown(at point: CGPoint) -> Bool {
+        let toolbarPoint = toolbarLayer.convert(point, from: rootLayer)
+        if pauseButtonLayer.frame.insetBy(dx: -4, dy: -4).contains(toolbarPoint) {
+            setCapturePaused(!isCapturePaused)
+            return true
+        }
+        if clearLogButtonLayer.frame.insetBy(dx: -4, dy: -4).contains(toolbarPoint) {
+            clearLog()
+            return true
+        }
+        return false
     }
 
     private func setScrollOffsetForScrollbarThumbY(_ thumbY: CGFloat) {
@@ -846,6 +1278,19 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         recordScrollSample()
         updateLayout()
         fetchVisibleWindow(force: false)
+    }
+
+    private func setProcessTimelineScrollOffsetForScrollbarThumbY(_ thumbY: CGFloat) {
+        let trackHeight = processTimelineScrollbarTrackLayer.bounds.height
+        let thumbHeight = processTimelineScrollbarThumbLayer.bounds.height
+        let travel = max(trackHeight - thumbHeight, 0)
+        guard travel > 0 else { return }
+
+        let clampedThumbY = min(max(thumbY, 0), travel)
+        let normalizedFromTop = (travel - clampedThumbY) / travel
+        processTimelineScrollOffset = normalizedFromTop * maxProcessTimelineScrollOffset()
+        clampProcessTimelineScrollOffset()
+        updateLayout()
     }
 
     private func handleFilterMouseDown(at point: CGPoint,
@@ -1195,6 +1640,75 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         }.resume()
     }
 
+    private func clearLog() {
+        guard let clearLogEndpoint,
+              let urlSession else { return }
+
+        logGeneration += 1
+        inFlight = false
+        pendingFetchAfterInFlight = false
+        processTimelineInFlight = false
+        urlSession.dataTask(with: clearLogEndpoint) { [weak self] data, _, error in
+            Task { @MainActor in
+                self?.handleClearLogResult(data: data, error: error)
+            }
+        }.resume()
+    }
+
+    private func handleClearLogResult(data: Data?, error: Error?) {
+        if let error {
+            lastErrorText = error.localizedDescription
+            updateStatusText()
+            updateColors()
+            return
+        }
+        guard let data else {
+            lastErrorText = "No clear response from backend"
+            updateStatusText()
+            updateColors()
+            return
+        }
+
+        do {
+            guard try decodeClearLogResponse(data) else {
+                lastErrorText = "Backend could not clear the log"
+                updateStatusText()
+                updateColors()
+                return
+            }
+            resetLogStateAfterClear()
+            lastErrorText = nil
+            updateStatusText()
+            updateColors()
+            fetchVisibleWindow(force: true)
+            fetchProcessTimeline(force: true)
+        } catch {
+            lastErrorText = "Could not decode clear response"
+            updateStatusText()
+            updateColors()
+        }
+    }
+
+    private func resetLogStateAfterClear() {
+        totalRows = 0
+        unfilteredRows = 0
+        currentWindowStart = 0
+        currentEvents = []
+        scrollOffset = 0
+        resetScrollPrediction()
+        lastRequestedStart = -1
+        lastRequestedCount = -1
+        lastRequestedTail = false
+        lastRequestedFilterKey = ""
+        inFlightFilterKey = ""
+        processTimelineResponse = nil
+        processTimelineRows = []
+        processTimelineScrollOffset = 0
+        updateRows()
+        updateProcessTimelineRows()
+        updateLayout()
+    }
+
     private func setFilterPanelExpanded(_ expanded: Bool) {
         guard isFilterPanelExpanded != expanded else {
             updateTextInputState()
@@ -1446,6 +1960,21 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         }
     }
 
+    private func updateTimelineRowLayerCount() {
+        let visibleRows = max(Int(ceil(processTimelineRowsClipLayer.bounds.height / processTimelineRowHeight)), 1)
+        let needed = min(max(visibleRows + 1, 1), max(processTimelineRows.count, 1))
+        while timelineRowLayers.count < needed {
+            timelineRowLayers.append(makeTimelineRowLayers())
+        }
+        for (index, row) in timelineRowLayers.enumerated() {
+            row.container.isHidden = index >= needed || processTimelineRows.isEmpty
+        }
+    }
+
+    private func processTimelineVisibleStartIndex() -> Int {
+        max(Int(floor(processTimelineScrollOffset / processTimelineRowHeight)), 0)
+    }
+
     private func visibleRowRange(for offset: CGFloat) -> (start: Int, end: Int) {
         let viewportHeight = max(rowsClipLayer.bounds.height, rowHeight)
         let start = max(Int(floor(offset / rowHeight)), 0)
@@ -1555,6 +2084,17 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             .joined(separator: "\u{1E}")
     }
 
+    private func activeFilterQueryItems() -> [URLQueryItem] {
+        let clauses = activeFilterClauses()
+        var queryItems = [URLQueryItem(name: "filterCount", value: String(clauses.count))]
+        for (index, clause) in clauses.enumerated() {
+            queryItems.append(URLQueryItem(name: "f\(index)column", value: clause.column.rawValue))
+            queryItems.append(URLQueryItem(name: "f\(index)op", value: clause.operation.rawValue))
+            queryItems.append(URLQueryItem(name: "f\(index)value", value: clause.value))
+        }
+        return queryItems
+    }
+
     private func responseCoversDesiredWindow(responseStart: Int, responseCount: Int) -> Bool {
         if isPinnedToBottom() {
             return responseCount > 0 || totalRows == 0
@@ -1597,13 +2137,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             URLQueryItem(name: "tail", value: tail ? "1" : "0")
         ]
         var queryItems = components?.queryItems ?? []
-        let clauses = activeFilterClauses()
-        queryItems.append(URLQueryItem(name: "filterCount", value: String(clauses.count)))
-        for (index, clause) in clauses.enumerated() {
-            queryItems.append(URLQueryItem(name: "f\(index)column", value: clause.column.rawValue))
-            queryItems.append(URLQueryItem(name: "f\(index)op", value: clause.operation.rawValue))
-            queryItems.append(URLQueryItem(name: "f\(index)value", value: clause.value))
-        }
+        queryItems.append(contentsOf: activeFilterQueryItems())
         components?.queryItems = queryItems
         guard let url = components?.url else { return }
 
@@ -1615,15 +2149,19 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         lastRequestedFilterKey = filterKey
         inFlightFilterKey = filterKey
         inFlightStartTime = CACurrentMediaTime()
+        let requestGeneration = logGeneration
         urlSession.dataTask(with: url) { [weak self] data, _, error in
             let errorText = error?.localizedDescription
             Task { @MainActor in
-                self?.handleFetchResult(data: data, errorText: errorText)
+                self?.handleFetchResult(data: data,
+                                        errorText: errorText,
+                                        generation: requestGeneration)
             }
         }.resume()
     }
 
-    private func handleFetchResult(data: Data?, errorText: String?) {
+    private func handleFetchResult(data: Data?, errorText: String?, generation: Int) {
+        guard generation == logGeneration else { return }
         inFlight = false
         lastFetchDuration = min(max(CACurrentMediaTime() - inFlightStartTime, 0.02), 1.0)
         let responseFilterKey = inFlightFilterKey
@@ -1671,6 +2209,149 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         }
     }
 
+    private func fetchProcessTimeline(force: Bool) {
+        guard let processTimelineEndpoint,
+              let urlSession else { return }
+        if processTimelineInFlight && !force {
+            return
+        }
+
+        processTimelineInFlight = true
+        let requestGeneration = logGeneration
+        urlSession.dataTask(with: processTimelineEndpoint) { [weak self] data, _, error in
+            let errorText = error?.localizedDescription
+            Task { @MainActor in
+                self?.handleProcessTimelineFetchResult(data: data,
+                                                       errorText: errorText,
+                                                       generation: requestGeneration)
+            }
+        }.resume()
+    }
+
+    private func handleProcessTimelineFetchResult(data: Data?, errorText: String?, generation: Int) {
+        guard generation == logGeneration else { return }
+        processTimelineInFlight = false
+        if let errorText {
+            lastErrorText = errorText
+            updateStatusText()
+            return
+        }
+        guard let data else {
+            lastErrorText = "No process timeline response from backend"
+            updateStatusText()
+            return
+        }
+
+        do {
+            let response = try decodeProcessTimelineResponse(data)
+            processTimelineResponse = response
+            processTimelineRows = orderedTimelineRows(from: response.processes)
+            clampProcessTimelineScrollOffset()
+            updateProcessTimelineRows()
+            updateLayout()
+        } catch {
+            lastErrorText = "Could not decode process timeline response"
+            updateStatusText()
+        }
+    }
+
+    private func updateProcessTimelineRows() {
+        withoutImplicitAnimations {
+            updateTimelineRowLayerCount()
+            layoutTimelineRows()
+        }
+    }
+
+    private func jumpToFirstEvent(for pid: Int) {
+        guard pid > 0,
+              let eventPositionEndpoint,
+              let urlSession else { return }
+
+        var components = URLComponents(url: eventPositionEndpoint, resolvingAgainstBaseURL: false)
+        var queryItems = [URLQueryItem(name: "pid", value: String(pid))]
+        queryItems.append(contentsOf: activeFilterQueryItems())
+        components?.queryItems = queryItems
+        guard let url = components?.url else { return }
+
+        urlSession.dataTask(with: url) { [weak self] data, _, error in
+            let errorText = error?.localizedDescription
+            Task { @MainActor in
+                self?.handleEventPositionResult(data: data, errorText: errorText)
+            }
+        }.resume()
+    }
+
+    private func handleEventPositionResult(data: Data?, errorText: String?) {
+        if let errorText {
+            lastErrorText = errorText
+            updateStatusText()
+            return
+        }
+        guard let data else {
+            lastErrorText = "No event position response from backend"
+            updateStatusText()
+            return
+        }
+
+        do {
+            let response = try decodeEventPositionResponse(data)
+            guard response.found else { return }
+            scrollOffset = CGFloat(response.index) * rowHeight
+            resetScrollPrediction()
+            clampScrollOffset()
+            lastRequestedStart = -1
+            lastRequestedCount = -1
+            lastRequestedTail = false
+            updateLayout()
+            fetchVisibleWindow(force: true)
+        } catch {
+            lastErrorText = "Could not decode binary event position response"
+            updateStatusText()
+        }
+    }
+
+    private func orderedTimelineRows(from processes: [TimelineProcess]) -> [TimelineProcessRow] {
+        let sorted = processes.sorted {
+            if $0.startTimestamp != $1.startTimestamp {
+                return $0.startTimestamp < $1.startTimestamp
+            }
+            return $0.pid < $1.pid
+        }
+        let byPID = Dictionary(uniqueKeysWithValues: sorted.map { ($0.pid, $0) })
+        var childrenByParent: [Int: [TimelineProcess]] = [:]
+        for process in sorted {
+            childrenByParent[process.ppid, default: []].append(process)
+        }
+        for parent in childrenByParent.keys {
+            childrenByParent[parent]?.sort {
+                if $0.startTimestamp != $1.startTimestamp {
+                    return $0.startTimestamp < $1.startTimestamp
+                }
+                return $0.pid < $1.pid
+            }
+        }
+
+        var rows: [TimelineProcessRow] = []
+        var visited = Set<Int>()
+
+        func appendSubtree(_ process: TimelineProcess, level: Int) {
+            guard !visited.contains(process.pid) else { return }
+            visited.insert(process.pid)
+            rows.append(TimelineProcessRow(process: process, level: level))
+            for child in childrenByParent[process.pid] ?? [] {
+                appendSubtree(child, level: min(level + 1, 8))
+            }
+        }
+
+        for process in sorted where process.ppid <= 0 || byPID[process.ppid] == nil {
+            appendSubtree(process, level: 0)
+        }
+        for process in sorted where !visited.contains(process.pid) {
+            appendSubtree(process, level: 0)
+        }
+        return rows
+    }
+
     private func updateRows() {
         withoutImplicitAnimations {
             updateRowLayerCount()
@@ -1701,7 +2382,24 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             let shownRows = totalRows
             let denominator = max(unfilteredRows, totalRows)
             let percentage = denominator > 0 ? Int((Double(shownRows) / Double(denominator) * 100).rounded()) : 0
-            statusLayer.string = "Showing \(formatCount(shownRows)) of \(formatCount(denominator)) events (\(percentage)%)"
+            let processText: String
+            if let processTimelineResponse {
+                processText = " - \(formatCount(processTimelineResponse.processCount)) processes"
+            } else {
+                processText = ""
+            }
+            statusLayer.string = "Showing \(formatCount(shownRows)) of \(formatCount(denominator)) events (\(percentage)%)\(processText)"
+        }
+    }
+
+    private func updateProcessTimelineHeaderText() {
+        withoutImplicitAnimations {
+            guard let response = processTimelineResponse else {
+                processTimelineRangeLayer.string = ""
+                return
+            }
+            let duration = max(response.captureEnd - response.captureStart, 0)
+            processTimelineRangeLayer.string = "\(formatCount(response.processCount)) processes over \(formatDuration(duration))"
         }
     }
 
@@ -1709,9 +2407,18 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         scrollOffset = min(max(scrollOffset, 0), maxScrollOffset())
     }
 
+    private func clampProcessTimelineScrollOffset() {
+        processTimelineScrollOffset = min(max(processTimelineScrollOffset, 0), maxProcessTimelineScrollOffset())
+    }
+
     private func maxScrollOffset() -> CGFloat {
         let contentHeight = CGFloat(totalRows) * rowHeight
         return max(contentHeight - rowsClipLayer.bounds.height, 0)
+    }
+
+    private func maxProcessTimelineScrollOffset() -> CGFloat {
+        let contentHeight = CGFloat(processTimelineRows.count) * processTimelineRowHeight
+        return max(contentHeight - processTimelineRowsClipLayer.bounds.height, 0)
     }
 
     private func isPinnedToBottom() -> Bool {
@@ -1746,6 +2453,8 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             appearance?.performAsCurrentDrawingAppearance {
                 rootLayer.backgroundColor = NSColor.windowBackgroundColor.cgColor
                 tableLayer.backgroundColor = NSColor.windowBackgroundColor.cgColor
+                processTimelineLayer.backgroundColor = NSColor.windowBackgroundColor.cgColor
+                processTimelineHeaderLayer.backgroundColor = NSColor.controlBackgroundColor.cgColor
                 toolbarLayer.backgroundColor = NSColor.windowBackgroundColor.cgColor
                 headerLayer.backgroundColor = NSColor.controlBackgroundColor.cgColor
                 let controlBrightness = NSColor.controlBackgroundColor.usingColorSpace(.deviceRGB)?.brightnessComponent ?? 1
@@ -1754,9 +2463,16 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                 rowsClipLayer.backgroundColor = NSColor.textBackgroundColor.cgColor
                 scrollbarTrackLayer.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.28).cgColor
                 scrollbarThumbLayer.backgroundColor = NSColor.secondaryLabelColor.withAlphaComponent(0.36).cgColor
+                processTimelineRowsClipLayer.backgroundColor = NSColor.textBackgroundColor.cgColor
+                processTimelineTitleLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
+                processTimelineRangeLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
+                processTimelineEmptyLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
+                processTimelineScrollbarTrackLayer.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.28).cgColor
+                processTimelineScrollbarThumbLayer.backgroundColor = NSColor.secondaryLabelColor.withAlphaComponent(0.36).cgColor
                 titleLayer.foregroundColor = NSColor.labelColor.cgColor
                 statusLayer.foregroundColor = lastErrorText == nil ? NSColor.secondaryLabelColor.cgColor : NSColor.systemRed.cgColor
                 pauseButtonLayer.backgroundColor = NSColor.clear.cgColor
+                clearLogButtonLayer.backgroundColor = NSColor.clear.cgColor
                 filterPillLayer.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.94).cgColor
                 filterPillLayer.borderColor = NSColor.separatorColor.cgColor
                 filterPillTextLayer.foregroundColor = NSColor.labelColor.cgColor
@@ -1781,7 +2497,11 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                 updateFilterRowColors()
                 updateFilterValueColors()
                 updateCaptureButtonAppearance()
+                updateClearLogButtonAppearance()
                 for row in rowLayers {
+                    applyColors(to: row)
+                }
+                for row in timelineRowLayers {
                     applyColors(to: row)
                 }
             }
@@ -1797,6 +2517,17 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             row.process.foregroundColor = NSColor.labelColor.cgColor
             row.path.foregroundColor = NSColor.labelColor.cgColor
             row.detail.foregroundColor = NSColor.secondaryLabelColor.cgColor
+        }
+    }
+
+    private func applyColors(to row: TimelineRowLayers) {
+        appearance?.performAsCurrentDrawingAppearance {
+            row.background.backgroundColor = NSColor.controlBackgroundColor.cgColor
+            row.name.foregroundColor = NSColor.labelColor.cgColor
+            row.pid.foregroundColor = NSColor.secondaryLabelColor.cgColor
+            row.events.foregroundColor = NSColor.secondaryLabelColor.cgColor
+            row.barTrack.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.30).cgColor
+            row.bar.backgroundColor = NSColor.systemGreen.withAlphaComponent(0.85).cgColor
         }
     }
 
@@ -1820,11 +2551,44 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         }
     }
 
+    private func updateClearLogButtonAppearance() {
+        appearance?.performAsCurrentDrawingAppearance {
+            clearLogButtonIconLayer.contents = makeSystemSymbolImage(systemSymbolName: "xmark.circle",
+                                                                     pointSize: 21,
+                                                                     weight: .regular,
+                                                                     scale: max(clearLogButtonIconLayer.contentsScale, 2),
+                                                                     tintColor: NSColor.secondaryLabelColor,
+                                                                     appearance: appearance ?? NSAppearance.currentDrawing())
+        }
+    }
+
     private func formatCount(_ value: Int) -> String {
         let formatter = NumberFormatter()
         formatter.numberStyle = .decimal
         formatter.locale = Locale.current
         return formatter.string(from: NSNumber(value: value)) ?? String(value)
+    }
+
+    private func formatCompactCount(_ value: UInt64) -> String {
+        if value >= 1_000_000 {
+            return "\(value / 1_000_000)m"
+        }
+        if value >= 1_000 {
+            return "\(value / 1_000)k"
+        }
+        return String(value)
+    }
+
+    private func formatDuration(_ seconds: Double) -> String {
+        if seconds < 1 {
+            return "\(Int((seconds * 1000).rounded())) ms"
+        }
+        if seconds < 60 {
+            return String(format: "%.1f s", seconds)
+        }
+        let minutes = Int(seconds / 60)
+        let remainder = Int(seconds.truncatingRemainder(dividingBy: 60))
+        return "\(minutes)m \(remainder)s"
     }
 
     private func withoutImplicitAnimations(_ body: () -> Void) {
@@ -1848,6 +2612,14 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                                                         role: .staticText,
                                                         frame: frameInRoot,
                                                         label: "\(event.time) \(event.type) \(event.pid) \(event.process) \(event.detail)"))
+        }
+
+        for (index, row) in processTimelineRows.prefix(20).enumerated() {
+            let process = row.process
+            children.append(OuterframeAccessibilityNode(identifier: UInt32(3000 + index),
+                                                        role: .staticText,
+                                                        frame: processTimelineLayer.frame,
+                                                        label: "\(process.process) pid \(process.pid), \(process.eventCount) events"))
         }
 
         let rootNode = OuterframeAccessibilityNode(identifier: 0,

@@ -7,6 +7,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
@@ -40,12 +41,22 @@
 #define EVENT_BINARY_HEADER_SIZE 40
 #define EVENT_BINARY_RECORD_SIZE 64
 #define EVENT_BINARY_MAX_COUNT 512
+#define PROCESS_TIMELINE_BINARY_MAGIC 0x50435254u
+#define PROCESS_TIMELINE_BINARY_VERSION 1
+#define PROCESS_TIMELINE_BINARY_HEADER_SIZE 48
+#define PROCESS_TIMELINE_BINARY_RECORD_SIZE 64
+#define EVENT_POSITION_BINARY_MAGIC 0x504a5254u
+#define EVENT_POSITION_BINARY_VERSION 1
+#define EVENT_POSITION_BINARY_HEADER_SIZE 40
+#define CLEAR_LOG_BINARY_MAGIC 0x434c5254u
+#define CLEAR_LOG_BINARY_VERSION 1
+#define CLEAR_LOG_BINARY_HEADER_SIZE 16
 #define PROCESS_NAME_LEN 128
 #define EVENT_PATH_LEN 512
 #define EVENT_FILTER_MAX_CLAUSES 16
 #define EVENT_FILTER_VALUE_LEN 256
 #define DEFAULT_PORT 7352
-#define SAMPLE_INTERVAL_MS 500
+#define SAMPLE_INTERVAL_MS 50
 
 #if defined(__GNUC__) || defined(__clang__)
 #define TRACE_UNUSED __attribute__((unused))
@@ -98,6 +109,25 @@ typedef struct {
 
 typedef struct {
     int pid;
+    int ppid;
+    char process[PROCESS_NAME_LEN];
+    double first_timestamp;
+    double start_timestamp;
+    double end_timestamp;
+    double last_timestamp;
+    uint64_t event_count;
+    bool has_start;
+    bool has_end;
+    bool open_at_start;
+} ProcessTimelineItem;
+
+typedef struct {
+    ProcessTimelineItem *items;
+    size_t count;
+} ProcessTimeline;
+
+typedef struct {
+    int pid;
     int fd;
     char path[EVENT_PATH_LEN];
 } FdPathEntry;
@@ -106,6 +136,16 @@ typedef struct {
     FdPathEntry *items;
     size_t count;
 } FdPathTable;
+
+typedef struct {
+    int pid;
+    int ppid;
+} ProcessParentEntry;
+
+typedef struct {
+    ProcessParentEntry *items;
+    size_t count;
+} ProcessParentTable;
 
 typedef struct {
     size_t count;
@@ -123,6 +163,7 @@ static EventStore g_events = {0};
 static ProcessSnapshot g_previous_snapshot = {0};
 static bool g_has_previous_snapshot = false;
 static FdPathTable g_fd_paths = {0};
+static ProcessParentTable g_process_parents = {0};
 static bool g_capture_paused = false;
 static bool g_capture_uses_ebpf = false;
 
@@ -166,6 +207,54 @@ static void fd_path_table_free(FdPathTable *table) {
     free(table->items);
     table->items = NULL;
     table->count = 0;
+}
+
+static void process_parent_table_free(ProcessParentTable *table) {
+    free(table->items);
+    table->items = NULL;
+    table->count = 0;
+}
+
+static ProcessParentEntry *process_parent_find(int pid) {
+    for (size_t i = 0; i < g_process_parents.count; ++i) {
+        if (g_process_parents.items[i].pid == pid) {
+            return &g_process_parents.items[i];
+        }
+    }
+    return NULL;
+}
+
+static TRACE_UNUSED int process_parent_lookup(int pid) {
+    ProcessParentEntry *entry = process_parent_find(pid);
+    return entry ? entry->ppid : 0;
+}
+
+static TRACE_UNUSED void process_parent_set(int pid, int ppid) {
+    if (pid <= 0 || ppid <= 0 || pid == ppid) {
+        return;
+    }
+    ProcessParentEntry *entry = process_parent_find(pid);
+    if (!entry) {
+        ProcessParentEntry *next = realloc(g_process_parents.items,
+                                           sizeof(ProcessParentEntry) * (g_process_parents.count + 1));
+        if (!next) {
+            return;
+        }
+        g_process_parents.items = next;
+        entry = &g_process_parents.items[g_process_parents.count++];
+    }
+    entry->pid = pid;
+    entry->ppid = ppid;
+}
+
+static TRACE_UNUSED void process_parent_remove(int pid) {
+    for (size_t i = 0; i < g_process_parents.count; ++i) {
+        if (g_process_parents.items[i].pid == pid) {
+            g_process_parents.items[i] = g_process_parents.items[g_process_parents.count - 1];
+            g_process_parents.count--;
+            return;
+        }
+    }
 }
 
 static FdPathEntry *fd_path_find(int pid, int fd) {
@@ -266,6 +355,19 @@ static TRACE_UNUSED bool resolve_fd_path(int pid, int fd, char *out, size_t out_
     return false;
 }
 
+static TRACE_UNUSED bool resolve_cached_fd_path(int pid, int fd, char *out, size_t out_size) {
+    if (out_size == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    FdPathEntry *entry = fd_path_find(pid, fd);
+    if (!entry) {
+        return false;
+    }
+    snprintf(out, out_size, "%s", entry->path);
+    return out[0] != '\0';
+}
+
 #ifdef __APPLE__
 static bool capture_process_snapshot(ProcessSnapshot *snapshot) {
     int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
@@ -297,6 +399,10 @@ static bool capture_process_snapshot(ProcessSnapshot *snapshot) {
     free(processes);
     qsort(snapshot->items, snapshot->count, sizeof(ProcessInfo), compare_process_info);
     return true;
+}
+
+static TRACE_UNUSED int normalize_process_parent_pid(int ppid) {
+    return ppid;
 }
 #else
 static bool read_linux_process_stat(int pid, ProcessInfo *info) {
@@ -336,6 +442,45 @@ static bool read_linux_process_stat(int pid, ProcessInfo *info) {
     info->pid = pid;
     info->ppid = ppid;
     return true;
+}
+
+static bool read_linux_process_tgid(int pid, int *tgid_out) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "/proc/%d/status", pid);
+
+    FILE *file = fopen(path, "r");
+    if (!file) {
+        return false;
+    }
+
+    char line[256];
+    bool found = false;
+    while (fgets(line, sizeof(line), file)) {
+        if (strncmp(line, "Tgid:", 5) != 0) {
+            continue;
+        }
+        char *value = line + 5;
+        while (*value && isspace((unsigned char)*value)) {
+            value++;
+        }
+        char *end = NULL;
+        long tgid = strtol(value, &end, 10);
+        if (tgid > 0 && tgid <= INT_MAX) {
+            *tgid_out = (int)tgid;
+            found = true;
+        }
+        break;
+    }
+    fclose(file);
+    return found;
+}
+
+static TRACE_UNUSED int normalize_process_parent_pid(int ppid) {
+    if (ppid <= 0) {
+        return ppid;
+    }
+    int tgid = 0;
+    return read_linux_process_tgid(ppid, &tgid) ? tgid : ppid;
 }
 
 static bool capture_process_snapshot(ProcessSnapshot *snapshot) {
@@ -381,7 +526,8 @@ static bool capture_process_snapshot(ProcessSnapshot *snapshot) {
 #define TRACE_BPF_FORK_CHILD_COMM_OFFSET 28
 #define TRACE_BPF_FORK_CHILD_PID_OFFSET 44
 #define TRACE_BPF_TEXT_LEN 128
-#define TRACE_PERF_RING_PAGES 8
+#define TRACE_PERF_RING_PAGES 1024
+#define TRACE_CAPTURE_RW_SYSCALLS 1
 
 typedef struct {
     uint64_t timestamp_ns;
@@ -880,14 +1026,19 @@ static void consume_perf_ring(PerfRing *ring) {
                 char detail[256];
                 char event_path[EVENT_PATH_LEN] = "";
                 if (bpf_event.event_type == TRACE_BPF_EVENT_FORK) {
+                    process.ppid = normalize_process_parent_pid(process.ppid);
+                    process_parent_set(process.pid, process.ppid);
                     fd_path_copy_pid(process.ppid, process.pid);
                     snprintf(detail, sizeof(detail), "Forked from parent pid %d", process.ppid);
                     add_event("process.fork", &process, "", detail);
                 } else if (bpf_event.event_type == TRACE_BPF_EVENT_EXIT) {
+                    process.ppid = process_parent_lookup(process.pid);
                     fd_path_remove_pid(process.pid);
+                    process_parent_remove(process.pid);
                     snprintf(detail, sizeof(detail), "Exited %s", process.name);
                     add_event("process.exit", &process, "", detail);
                 } else if (bpf_event.event_type == TRACE_BPF_EVENT_OPENAT) {
+                    process.ppid = process_parent_lookup(process.pid);
                     snprintf(event_path, sizeof(event_path), "%s", bpf_event.text[0] ? bpf_event.text : "");
                     snprintf(detail, sizeof(detail), "dfd=%lld flags=0x%llx path=%s",
                              (long long)bpf_event.arg0,
@@ -895,23 +1046,27 @@ static void consume_perf_ring(PerfRing *ring) {
                              bpf_event.text[0] ? bpf_event.text : "(unavailable)");
                     add_event("file.openat", &process, event_path, detail);
                 } else if (bpf_event.event_type == TRACE_BPF_EVENT_OPENAT2) {
+                    process.ppid = process_parent_lookup(process.pid);
                     snprintf(event_path, sizeof(event_path), "%s", bpf_event.text[0] ? bpf_event.text : "");
                     snprintf(detail, sizeof(detail), "dfd=%lld path=%s",
                              (long long)bpf_event.arg0,
                              bpf_event.text[0] ? bpf_event.text : "(unavailable)");
                     add_event("file.openat2", &process, event_path, detail);
                 } else if (bpf_event.event_type == TRACE_BPF_EVENT_EXECVE) {
+                    process.ppid = process_parent_lookup(process.pid);
                     snprintf(event_path, sizeof(event_path), "%s", bpf_event.text[0] ? bpf_event.text : "");
                     snprintf(detail, sizeof(detail), "path=%s",
                              bpf_event.text[0] ? bpf_event.text : "(unavailable)");
                     add_event("process.execve", &process, event_path, detail);
                 } else if (bpf_event.event_type == TRACE_BPF_EVENT_CLOSE) {
+                    process.ppid = process_parent_lookup(process.pid);
                     int fd = (int)bpf_event.arg0;
                     resolve_fd_path(process.pid, fd, event_path, sizeof(event_path));
                     snprintf(detail, sizeof(detail), "fd=%llu", (unsigned long long)bpf_event.arg0);
                     add_event("file.close", &process, event_path, detail);
                     fd_path_remove(process.pid, fd);
                 } else if (bpf_event.event_type == TRACE_BPF_EVENT_READ) {
+                    process.ppid = process_parent_lookup(process.pid);
                     int fd = (int)bpf_event.arg0;
                     resolve_fd_path(process.pid, fd, event_path, sizeof(event_path));
                     snprintf(detail, sizeof(detail), "fd=%llu count=%llu",
@@ -919,6 +1074,7 @@ static void consume_perf_ring(PerfRing *ring) {
                              (unsigned long long)bpf_event.arg1);
                     add_event("file.read", &process, event_path, detail);
                 } else if (bpf_event.event_type == TRACE_BPF_EVENT_WRITE) {
+                    process.ppid = process_parent_lookup(process.pid);
                     int fd = (int)bpf_event.arg0;
                     resolve_fd_path(process.pid, fd, event_path, sizeof(event_path));
                     snprintf(detail, sizeof(detail), "fd=%llu count=%llu",
@@ -928,9 +1084,22 @@ static void consume_perf_ring(PerfRing *ring) {
                 }
             }
         } else if (header.type == PERF_RECORD_LOST) {
+            uint64_t lost_count = 0;
+            if (header.size >= sizeof(header) + sizeof(uint64_t) * 2) {
+                copy_from_perf_ring(&lost_count, data, ring->data_size, tail,
+                                     sizeof(header) + sizeof(uint64_t), sizeof(lost_count));
+            }
             ProcessInfo self = {.pid = 0, .ppid = 0};
             snprintf(self.name, sizeof(self.name), "trace");
-            add_event("capture.lost", &self, "", "Kernel perf ring reported lost eBPF events");
+            char detail[256];
+            if (lost_count > 0) {
+                snprintf(detail, sizeof(detail),
+                         "Kernel perf ring reported %" PRIu64 " lost eBPF events",
+                         lost_count);
+            } else {
+                snprintf(detail, sizeof(detail), "Kernel perf ring reported lost eBPF events");
+            }
+            add_event("capture.lost", &self, "", detail);
         }
 
         tail += header.size;
@@ -1052,8 +1221,10 @@ static bool start_ebpf_capture(EBPFCapture *capture, char *error, size_t error_s
     SyscallTracepointOffsets openat2_offsets = read_syscall_tracepoint_offsets("sys_enter_openat2", "dfd", NULL, "filename");
     SyscallTracepointOffsets execve_offsets = read_syscall_tracepoint_offsets("sys_enter_execve", NULL, NULL, "filename");
     SyscallTracepointOffsets close_offsets = read_syscall_tracepoint_offsets("sys_enter_close", "fd", NULL, NULL);
+#if TRACE_CAPTURE_RW_SYSCALLS
     SyscallTracepointOffsets read_offsets = read_syscall_tracepoint_offsets("sys_enter_read", "fd", "count", NULL);
     SyscallTracepointOffsets write_offsets = read_syscall_tracepoint_offsets("sys_enter_write", "fd", "count", NULL);
+#endif
     for (int cpu = 0; cpu < capture->cpu_count; ++cpu) {
         int fork_prog_fd = load_fork_bpf_program(capture->perf_map_fd, cpu, fork_offsets, error, error_size);
         if (!load_and_attach_program(capture, "sched", "sched_process_fork", cpu, fork_prog_fd, error, error_size)) {
@@ -1089,6 +1260,7 @@ static bool start_ebpf_capture(EBPFCapture *capture, char *error, size_t error_s
             stop_ebpf_capture(capture);
             return false;
         }
+#if TRACE_CAPTURE_RW_SYSCALLS
         int read_prog_fd = load_syscall_bpf_program(capture->perf_map_fd, cpu, TRACE_BPF_EVENT_READ,
                                                     read_offsets, "trace_read", error, error_size);
         if (!load_and_attach_program(capture, "syscalls", "sys_enter_read", cpu, read_prog_fd, error, error_size)) {
@@ -1101,6 +1273,7 @@ static bool start_ebpf_capture(EBPFCapture *capture, char *error, size_t error_s
             stop_ebpf_capture(capture);
             return false;
         }
+#endif
     }
 
     capture->active = true;
@@ -1168,6 +1341,21 @@ static void event_store_close(EventStore *store) {
     }
     memset(store, 0, sizeof(*store));
     store->fd = -1;
+}
+
+static bool event_store_clear(EventStore *store) {
+    if (store->fd < 0) {
+        return false;
+    }
+    if (ftruncate(store->fd, 0) != 0) {
+        return false;
+    }
+    if (lseek(store->fd, 0, SEEK_SET) < 0) {
+        return false;
+    }
+    store->count = 0;
+    store->next_id = 0;
+    return true;
 }
 
 static bool write_all_fd(int fd, const void *data, size_t len) {
@@ -1354,6 +1542,24 @@ static void set_capture_paused(bool paused) {
     add_event("capture.resume", &self, "", "Resumed event capture");
 }
 
+static bool clear_capture_log(void) {
+    if (g_capture_uses_ebpf) {
+        discard_ebpf_ring_backlog(&g_ebpf_capture);
+    }
+    free(g_fd_paths.items);
+    g_fd_paths.items = NULL;
+    g_fd_paths.count = 0;
+    process_parent_table_free(&g_process_parents);
+
+    if (!event_store_clear(&g_events)) {
+        return false;
+    }
+    if (!g_capture_uses_ebpf) {
+        refresh_process_baseline();
+    }
+    return true;
+}
+
 static void format_event_time(double timestamp, char *buffer, size_t buffer_size) {
     time_t seconds = (time_t)timestamp;
     struct tm local_time;
@@ -1500,6 +1706,308 @@ static bool event_matches_filter(const TraceEvent *event, const EventFilter *fil
     return true;
 }
 
+static void free_process_timeline(ProcessTimeline *timeline) {
+    free(timeline->items);
+    timeline->items = NULL;
+    timeline->count = 0;
+}
+
+static ProcessTimelineItem *find_process_timeline_item(ProcessTimeline *timeline, int pid) {
+    for (size_t i = 0; i < timeline->count; ++i) {
+        if (timeline->items[i].pid == pid) {
+            return &timeline->items[i];
+        }
+    }
+    return NULL;
+}
+
+static bool is_known_process_name(const char *process);
+
+static ProcessTimelineItem *append_process_timeline_item(ProcessTimeline *timeline, const TraceEvent *event) {
+    ProcessTimelineItem *next = realloc(timeline->items, sizeof(ProcessTimelineItem) * (timeline->count + 1));
+    if (!next) {
+        return NULL;
+    }
+    timeline->items = next;
+
+    ProcessTimelineItem *item = &timeline->items[timeline->count++];
+    memset(item, 0, sizeof(*item));
+    item->pid = event->pid;
+    item->ppid = event->ppid;
+    snprintf(item->process, sizeof(item->process), "%s", event->process);
+    item->first_timestamp = event->timestamp;
+    item->start_timestamp = event->timestamp;
+    item->end_timestamp = event->timestamp;
+    item->last_timestamp = event->timestamp;
+    return item;
+}
+
+static ProcessTimelineItem *ensure_process_timeline_parent_item(ProcessTimeline *timeline,
+                                                                const TraceEvent *fork_event) {
+    if (fork_event->ppid <= 0) {
+        return NULL;
+    }
+    ProcessTimelineItem *parent = find_process_timeline_item(timeline, fork_event->ppid);
+    if (parent) {
+        if (!is_known_process_name(parent->process) && is_known_process_name(fork_event->process)) {
+            snprintf(parent->process, sizeof(parent->process), "%.*s",
+                     (int)sizeof(parent->process) - 1,
+                     fork_event->process);
+        }
+        return parent;
+    }
+
+    TraceEvent parent_event = *fork_event;
+    parent_event.pid = fork_event->ppid;
+    parent_event.ppid = 0;
+    if (!is_known_process_name(parent_event.process)) {
+        snprintf(parent_event.process, sizeof(parent_event.process), "pid-%d", parent_event.pid);
+    }
+    parent = append_process_timeline_item(timeline, &parent_event);
+    if (!parent) {
+        return NULL;
+    }
+    parent->event_count = 0;
+    parent->open_at_start = true;
+    return parent;
+}
+
+static bool is_process_start_event(const TraceEvent *event) {
+    return strcmp(event->type, "process.fork") == 0 ||
+           strcmp(event->type, "process.start") == 0 ||
+           strcmp(event->type, "process.present") == 0;
+}
+
+static bool is_process_exit_event(const TraceEvent *event) {
+    return strcmp(event->type, "process.exit") == 0;
+}
+
+static bool is_known_process_name(const char *process) {
+    return process &&
+           process[0] != '\0' &&
+           strcmp(process, "unknown") != 0 &&
+           strcmp(process, "trace") != 0;
+}
+
+static const char *path_basename(const char *path) {
+    if (!path || path[0] == '\0') {
+        return "";
+    }
+    const char *slash = strrchr(path, '/');
+    return slash && slash[1] ? slash + 1 : path;
+}
+
+static void update_process_timeline_name(ProcessTimelineItem *item, const TraceEvent *event) {
+    if (strcmp(event->type, "process.execve") == 0 && event->path[0] != '\0') {
+        snprintf(item->process, sizeof(item->process), "%.*s",
+                 (int)sizeof(item->process) - 1,
+                 path_basename(event->path));
+        return;
+    }
+
+    if (strcmp(event->type, "process.fork") != 0 && is_known_process_name(event->process)) {
+        snprintf(item->process, sizeof(item->process), "%.*s",
+                 (int)sizeof(item->process) - 1,
+                 event->process);
+        return;
+    }
+
+    if (!is_known_process_name(item->process) && is_known_process_name(event->process)) {
+        snprintf(item->process, sizeof(item->process), "%.*s",
+                 (int)sizeof(item->process) - 1,
+                 event->process);
+    }
+}
+
+static int compare_process_timeline_items(const void *lhs, const void *rhs) {
+    const ProcessTimelineItem *a = (const ProcessTimelineItem *)lhs;
+    const ProcessTimelineItem *b = (const ProcessTimelineItem *)rhs;
+    if (a->start_timestamp < b->start_timestamp) {
+        return -1;
+    }
+    if (a->start_timestamp > b->start_timestamp) {
+        return 1;
+    }
+    return (a->pid > b->pid) - (a->pid < b->pid);
+}
+
+static bool build_process_timeline(ProcessTimeline *timeline,
+                                   double *capture_start_out,
+                                   double *capture_end_out,
+                                   uint64_t *event_count_out) {
+    memset(timeline, 0, sizeof(*timeline));
+    *capture_start_out = 0;
+    *capture_end_out = 0;
+    *event_count_out = (uint64_t)g_events.count;
+
+    bool has_any_event = false;
+    for (size_t i = 0; i < g_events.count; ++i) {
+        TraceEvent event;
+        if (!read_event_at_chronological_index(i, &event)) {
+            free_process_timeline(timeline);
+            return false;
+        }
+
+        if (!has_any_event) {
+            *capture_start_out = event.timestamp;
+            has_any_event = true;
+        }
+        if (event.timestamp > *capture_end_out) {
+            *capture_end_out = event.timestamp;
+        }
+
+        if (event.pid <= 0) {
+            continue;
+        }
+        if (strcmp(event.type, "process.fork") == 0 && event.ppid > 0) {
+            if (!ensure_process_timeline_parent_item(timeline, &event)) {
+                free_process_timeline(timeline);
+                return false;
+            }
+        }
+
+        ProcessTimelineItem *item = find_process_timeline_item(timeline, event.pid);
+        if (!item) {
+            item = append_process_timeline_item(timeline, &event);
+            if (!item) {
+                free_process_timeline(timeline);
+                return false;
+            }
+        }
+
+        item->event_count++;
+        if (event.timestamp < item->first_timestamp) {
+            item->first_timestamp = event.timestamp;
+        }
+        if (event.timestamp > item->last_timestamp) {
+            item->last_timestamp = event.timestamp;
+        }
+        if (item->ppid <= 0 && event.ppid > 0) {
+            item->ppid = event.ppid;
+        }
+        update_process_timeline_name(item, &event);
+
+        if (is_process_start_event(&event)) {
+            if (!item->has_start || event.timestamp < item->start_timestamp) {
+                item->start_timestamp = event.timestamp;
+            }
+            item->has_start = true;
+            if (strcmp(event.type, "process.present") == 0) {
+                item->open_at_start = true;
+            }
+        }
+
+        if (is_process_exit_event(&event)) {
+            item->has_end = true;
+            if (event.timestamp > item->end_timestamp) {
+                item->end_timestamp = event.timestamp;
+            }
+        } else if (!item->has_end) {
+            item->end_timestamp = item->last_timestamp;
+        }
+    }
+
+    if (!has_any_event) {
+        *capture_start_out = *capture_end_out;
+    }
+
+    for (size_t i = 0; i < timeline->count; ++i) {
+        ProcessTimelineItem *item = &timeline->items[i];
+        if (!item->has_start) {
+            item->start_timestamp = *capture_start_out;
+            item->open_at_start = true;
+        } else if (item->first_timestamp < item->start_timestamp) {
+            item->start_timestamp = item->first_timestamp;
+        }
+        if (!item->has_end) {
+            item->end_timestamp = *capture_end_out;
+        } else if (item->last_timestamp > item->end_timestamp) {
+            item->end_timestamp = item->last_timestamp;
+        }
+        if (item->end_timestamp < item->start_timestamp) {
+            item->end_timestamp = item->start_timestamp;
+        }
+    }
+
+    qsort(timeline->items, timeline->count, sizeof(ProcessTimelineItem), compare_process_timeline_items);
+    return true;
+}
+
+static size_t build_process_timeline_binary(unsigned char **buffer_out) {
+    ProcessTimeline timeline = {0};
+    double capture_start = 0;
+    double capture_end = 0;
+    uint64_t event_count = 0;
+    if (!build_process_timeline(&timeline, &capture_start, &capture_end, &event_count)) {
+        return 0;
+    }
+
+    if (timeline.count > UINT32_MAX) {
+        free_process_timeline(&timeline);
+        return 0;
+    }
+
+    size_t fixed_size = PROCESS_TIMELINE_BINARY_HEADER_SIZE +
+                        timeline.count * PROCESS_TIMELINE_BINARY_RECORD_SIZE;
+    size_t variable_size = 0;
+    for (size_t i = 0; i < timeline.count; ++i) {
+        variable_size += strlen(timeline.items[i].process);
+    }
+    if (fixed_size > SIZE_MAX - variable_size) {
+        free_process_timeline(&timeline);
+        return 0;
+    }
+
+    size_t total_size = fixed_size + variable_size;
+    unsigned char *buffer = calloc(1, total_size == 0 ? 1 : total_size);
+    if (!buffer) {
+        free_process_timeline(&timeline);
+        return 0;
+    }
+
+    write_uint32_le(buffer + 0, PROCESS_TIMELINE_BINARY_MAGIC);
+    write_uint16_le(buffer + 4, PROCESS_TIMELINE_BINARY_VERSION);
+    write_uint16_le(buffer + 6, PROCESS_TIMELINE_BINARY_HEADER_SIZE);
+    write_double_le(buffer + 8, capture_start);
+    write_double_le(buffer + 16, capture_end);
+    write_uint32_le(buffer + 24, (uint32_t)timeline.count);
+    write_uint32_le(buffer + 28, PROCESS_TIMELINE_BINARY_RECORD_SIZE);
+    write_uint64_le(buffer + 32, event_count);
+    write_uint64_le(buffer + 40, (uint64_t)timeline.count);
+
+    size_t variable_offset = fixed_size;
+    for (size_t i = 0; i < timeline.count; ++i) {
+        ProcessTimelineItem *item = &timeline.items[i];
+        size_t record_offset = PROCESS_TIMELINE_BINARY_HEADER_SIZE +
+                               i * PROCESS_TIMELINE_BINARY_RECORD_SIZE;
+        uint32_t flags = 0;
+        if (item->open_at_start) {
+            flags |= 1u;
+        }
+        if (!item->has_end) {
+            flags |= 2u;
+        }
+
+        write_uint32_le(buffer + record_offset + 0, (uint32_t)item->pid);
+        write_uint32_le(buffer + record_offset + 4, (uint32_t)item->ppid);
+        write_double_le(buffer + record_offset + 8, item->first_timestamp);
+        write_double_le(buffer + record_offset + 16, item->start_timestamp);
+        write_double_le(buffer + record_offset + 24, item->end_timestamp);
+        write_double_le(buffer + record_offset + 32, item->last_timestamp);
+        write_uint64_le(buffer + record_offset + 40, item->event_count);
+        write_uint32_le(buffer + record_offset + 48, flags);
+        if (!append_string_ref(buffer, total_size, &variable_offset, record_offset + 52, item->process)) {
+            free(buffer);
+            free_process_timeline(&timeline);
+            return 0;
+        }
+    }
+
+    free_process_timeline(&timeline);
+    *buffer_out = buffer;
+    return total_size;
+}
+
 static size_t build_events_binary(size_t start, size_t count, bool tail, const EventFilter *filter, unsigned char **buffer_out) {
     if (count > EVENT_BINARY_MAX_COUNT) {
         count = EVENT_BINARY_MAX_COUNT;
@@ -1511,41 +2019,68 @@ static size_t build_events_binary(size_t start, size_t count, bool tail, const E
     size_t response_start = start;
     size_t tail_cursor = 0;
 
-    for (size_t i = 0; i < g_events.count; ++i) {
-        TraceEvent event;
-        if (!read_event_at_chronological_index(i, &event)) {
-            return 0;
-        }
-        if (!event_matches_filter(&event, filter)) {
-            continue;
-        }
+    if (filter->count == 0) {
+        filtered_count = g_events.count;
         if (tail) {
-            if (count > 0) {
-                if (event_count < count) {
-                    events[event_count++] = event;
-                } else {
-                    events[tail_cursor] = event;
-                    tail_cursor = (tail_cursor + 1) % count;
-                }
-            }
-        } else if (filtered_count >= start && event_count < count) {
-            events[event_count++] = event;
+            event_count = count < g_events.count ? count : g_events.count;
+            response_start = g_events.count > event_count ? g_events.count - event_count : 0;
+        } else {
+            response_start = start > g_events.count ? g_events.count : start;
+            size_t available = g_events.count - response_start;
+            event_count = count < available ? count : available;
         }
-        filtered_count++;
+        size_t output_count = 0;
+        for (size_t i = 0; i < event_count; ++i) {
+            TraceEvent event;
+            if (!read_event_at_chronological_index(response_start + i, &event)) {
+                return 0;
+            }
+            if (event.id != 0) {
+                events[output_count++] = event;
+            }
+        }
+        event_count = output_count;
+    } else {
+        for (size_t i = 0; i < g_events.count; ++i) {
+            TraceEvent event;
+            if (!read_event_at_chronological_index(i, &event)) {
+                return 0;
+            }
+            if (event.id == 0) {
+                continue;
+            }
+            if (!event_matches_filter(&event, filter)) {
+                continue;
+            }
+            if (tail) {
+                if (count > 0) {
+                    if (event_count < count) {
+                        events[event_count++] = event;
+                    } else {
+                        events[tail_cursor] = event;
+                        tail_cursor = (tail_cursor + 1) % count;
+                    }
+                }
+            } else if (filtered_count >= start && event_count < count) {
+                events[event_count++] = event;
+            }
+            filtered_count++;
+        }
+
+        if (tail) {
+            response_start = filtered_count > event_count ? filtered_count - event_count : 0;
+            if (event_count == count && tail_cursor > 0) {
+                TraceEvent ordered[EVENT_BINARY_MAX_COUNT];
+                for (size_t i = 0; i < event_count; ++i) {
+                    ordered[i] = events[(tail_cursor + i) % event_count];
+                }
+                memcpy(events, ordered, sizeof(TraceEvent) * event_count);
+            }
+        } else {
+            response_start = start > filtered_count ? filtered_count : start;
+        }
     }
 
-    if (tail) {
-        response_start = filtered_count > event_count ? filtered_count - event_count : 0;
-        if (event_count == count && tail_cursor > 0) {
-            TraceEvent ordered[EVENT_BINARY_MAX_COUNT];
-            for (size_t i = 0; i < event_count; ++i) {
-                ordered[i] = events[(tail_cursor + i) % event_count];
-            }
-            memcpy(events, ordered, sizeof(TraceEvent) * event_count);
-        }
-    } else {
-        response_start = start > filtered_count ? filtered_count : start;
-    }
     size_t fixed_size = EVENT_BINARY_HEADER_SIZE + event_count * EVENT_BINARY_RECORD_SIZE;
     size_t variable_size = 0;
     for (size_t i = 0; i < event_count; ++i) {
@@ -1902,6 +2437,110 @@ static void send_events_response(int fd, const char *query) {
     free(payload);
 }
 
+static size_t build_event_position_binary(int pid, const EventFilter *filter, unsigned char **buffer_out) {
+    unsigned char *buffer = calloc(1, EVENT_POSITION_BINARY_HEADER_SIZE);
+    if (!buffer) {
+        return 0;
+    }
+
+    uint64_t index = UINT64_MAX;
+    uint64_t event_id = 0;
+    double timestamp = 0;
+    uint32_t found = 0;
+    size_t filtered_index = 0;
+
+    if (pid > 0) {
+        for (size_t i = 0; i < g_events.count; ++i) {
+            TraceEvent event;
+            if (!read_event_at_chronological_index(i, &event)) {
+                free(buffer);
+                return 0;
+            }
+            if (!event_matches_filter(&event, filter)) {
+                continue;
+            }
+            if (event.pid == pid) {
+                index = (uint64_t)filtered_index;
+                event_id = event.id;
+                timestamp = event.timestamp;
+                found = 1;
+                break;
+            }
+            filtered_index++;
+        }
+    }
+
+    write_uint32_le(buffer + 0, EVENT_POSITION_BINARY_MAGIC);
+    write_uint16_le(buffer + 4, EVENT_POSITION_BINARY_VERSION);
+    write_uint16_le(buffer + 6, EVENT_POSITION_BINARY_HEADER_SIZE);
+    write_uint64_le(buffer + 8, index);
+    write_uint64_le(buffer + 16, event_id);
+    write_double_le(buffer + 24, timestamp);
+    write_uint32_le(buffer + 32, found);
+    write_uint32_le(buffer + 36, 0);
+
+    *buffer_out = buffer;
+    return EVENT_POSITION_BINARY_HEADER_SIZE;
+}
+
+static void send_event_position_response(int fd, const char *query) {
+    size_t pid_value = 0;
+    parse_size_query_value(query, "pid", &pid_value);
+    int pid = pid_value <= (size_t)INT_MAX ? (int)pid_value : 0;
+    EventFilter filter = parse_event_filter_query(query);
+
+    unsigned char *payload = NULL;
+    size_t len = build_event_position_binary(pid, &filter, &payload);
+    if (len == 0) {
+        send_text_response(fd, 500, "failed to build event position response\n");
+        return;
+    }
+    send_response(fd, 200, "OK", "application/vnd.trace.position", payload, len);
+    free(payload);
+}
+
+static void send_process_timeline_response(int fd) {
+    unsigned char *payload = NULL;
+    size_t len = build_process_timeline_binary(&payload);
+    if (len == 0) {
+        send_text_response(fd, 500, "failed to build process timeline response\n");
+        return;
+    }
+    send_response(fd, 200, "OK", "application/vnd.trace.processes", payload, len);
+    free(payload);
+}
+
+static size_t build_clear_log_binary(bool cleared, unsigned char **buffer_out) {
+    unsigned char *buffer = calloc(1, CLEAR_LOG_BINARY_HEADER_SIZE);
+    if (!buffer) {
+        return 0;
+    }
+    write_uint32_le(buffer + 0, CLEAR_LOG_BINARY_MAGIC);
+    write_uint16_le(buffer + 4, CLEAR_LOG_BINARY_VERSION);
+    write_uint16_le(buffer + 6, CLEAR_LOG_BINARY_HEADER_SIZE);
+    write_uint32_le(buffer + 8, cleared ? 1u : 0u);
+    write_uint32_le(buffer + 12, 0);
+    *buffer_out = buffer;
+    return CLEAR_LOG_BINARY_HEADER_SIZE;
+}
+
+static void send_clear_log_response(int fd) {
+    bool cleared = clear_capture_log();
+    unsigned char *payload = NULL;
+    size_t len = build_clear_log_binary(cleared, &payload);
+    if (len == 0) {
+        send_text_response(fd, 500, "failed to build clear response\n");
+        return;
+    }
+    send_response(fd,
+                  cleared ? 200 : 500,
+                  cleared ? "OK" : "Internal Server Error",
+                  "application/vnd.trace.clear",
+                  payload,
+                  len);
+    free(payload);
+}
+
 static void send_capture_response(int fd, const char *query) {
     char value[16];
     if (parse_string_query_value(query, "paused", value, sizeof(value))) {
@@ -1960,6 +2599,12 @@ static void handle_client(int fd) {
         send_bundle_file(fd, path);
     } else if (strcmp(target, "/api/events") == 0) {
         send_events_response(fd, query);
+    } else if (strcmp(target, "/api/event-position") == 0) {
+        send_event_position_response(fd, query);
+    } else if (strcmp(target, "/api/processes") == 0) {
+        send_process_timeline_response(fd);
+    } else if (strcmp(target, "/api/clear") == 0) {
+        send_clear_log_response(fd);
     } else if (strcmp(target, "/api/capture") == 0) {
         send_capture_response(fd, query);
     } else {
@@ -2078,6 +2723,7 @@ int main(int argc, char **argv) {
                 stop_ebpf_capture(&g_ebpf_capture);
                 event_store_close(&g_events);
                 fd_path_table_free(&g_fd_paths);
+                process_parent_table_free(&g_process_parents);
                 return 1;
             }
             ProcessInfo self = {.pid = 0, .ppid = 0};
@@ -2103,6 +2749,7 @@ int main(int argc, char **argv) {
         stop_ebpf_capture(&g_ebpf_capture);
         event_store_close(&g_events);
         fd_path_table_free(&g_fd_paths);
+        process_parent_table_free(&g_process_parents);
         return 1;
     }
 
@@ -2138,5 +2785,6 @@ int main(int argc, char **argv) {
     event_store_close(&g_events);
     free_process_snapshot(&g_previous_snapshot);
     fd_path_table_free(&g_fd_paths);
+    process_parent_table_free(&g_process_parents);
     return 0;
 }
