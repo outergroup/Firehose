@@ -1,0 +1,34 @@
+# macOS
+.DS_Store
+._*
+
+# Xcode user/local state
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+
+# Build products and derived data
+build/
+.build/
+DerivedData/
+*.hmap
+*.dSYM/
+*.dSYM.zip
+
+# Local packaged artifacts
+*.aar
+*.outer
+*.bundle/
+
+# Local backend/runtime output
+TraceBackend
+TraceBackend.*
+trace-events-*
+*.log
+
+# SwiftPM/editor scratch
+.swiftpm/
+.vscode/
+.idea/
+*.swp
+*.swo
