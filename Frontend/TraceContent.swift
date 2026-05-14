@@ -532,9 +532,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     private let scrollbarTrackLayer = CALayer()
     private let scrollbarThumbLayer = CALayer()
     private let processTimelineLayer = CALayer()
-    private let processTimelineHeaderLayer = CALayer()
-    private let processTimelineTitleLayer = CATextLayer()
-    private let processTimelineRangeLayer = CATextLayer()
+    private let processTimelineDividerLayer = CALayer()
     private let processTimelineRowsClipLayer = CALayer()
     private let processTimelineEventDotLayers: [CAShapeLayer] = [
         CAShapeLayer(),
@@ -600,7 +598,8 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     private var capturePauseReason: CapturePauseReason = .none
     private var captureStorageStatus: CaptureStatus?
     private var processTimelineInFlight = false
-    private var lastProcessTimelinePollTime: CFTimeInterval = 0
+    private var pendingProcessTimelineFetchAfterInFlight = false
+    private var lastProcessTimelineRequestedEventCount: UInt64 = 0
     private var processTimelineResponse: ProcessTimelineResponse?
     private var processTimelineRows: [TimelineProcessRow] = []
     private var processTimelineDotsByPID: [Int: [TimelineEventDot]] = [:]
@@ -612,7 +611,6 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     private let toolbarHeight: CGFloat = 58
     private let headerHeight: CGFloat = 30
     private let rowHeight: CGFloat = 26
-    private let processTimelineHeaderHeight: CGFloat = 28
     private let processTimelineRowHeight: CGFloat = 22
     private let processTimelineMinHeight: CGFloat = 132
     private let processTimelineMaxHeight: CGFloat = 220
@@ -623,6 +621,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     private let scrollbarWidth: CGFloat = 9
     private let scrollbarTrailingInset: CGFloat = 4
     private let scrollbarHitSlop: CGFloat = 5
+    private let scrollbarVerticalDividerPadding: CGFloat = 3
     private let overscanScreens: CGFloat = 2
     private let renderedRowOverscan: Int = 8
     private let maxPrefetchRows = 512
@@ -630,6 +629,8 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     private let filterPillSize = CGSize(width: 260, height: 28)
     private let pauseButtonSize = CGSize(width: 28, height: 28)
     private let clearLogButtonSize = CGSize(width: 28, height: 28)
+    private let toolbarButtonIconInset: CGFloat = 2
+    private let toolbarButtonSymbolPointSize: CGFloat = 22
     private let filterPanelSize = CGSize(width: 460, height: 238)
     private let filterValueFont = NSFont.systemFont(ofSize: 12, weight: .regular)
     private let filterCaretWidth: CGFloat = 1
@@ -812,11 +813,6 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             Task { @MainActor in
                 guard let self else { return }
                 self.fetchVisibleWindow(force: true)
-                let now = CACurrentMediaTime()
-                if now - self.lastProcessTimelinePollTime >= 3.0 {
-                    self.lastProcessTimelinePollTime = now
-                    self.fetchProcessTimeline(force: false)
-                }
             }
         }
     }
@@ -844,11 +840,9 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         tableLayer.addSublayer(rowsClipLayer)
         tableLayer.addSublayer(scrollbarTrackLayer)
         scrollbarTrackLayer.addSublayer(scrollbarThumbLayer)
-        processTimelineLayer.addSublayer(processTimelineHeaderLayer)
+        processTimelineLayer.addSublayer(processTimelineDividerLayer)
         processTimelineLayer.addSublayer(processTimelineRowsClipLayer)
         processTimelineLayer.addSublayer(processTimelineScrollbarTrackLayer)
-        processTimelineHeaderLayer.addSublayer(processTimelineTitleLayer)
-        processTimelineHeaderLayer.addSublayer(processTimelineRangeLayer)
         for dotLayer in processTimelineEventDotLayers {
             dotLayer.zPosition = 5
             dotLayer.contentsScale = 2
@@ -883,16 +877,6 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         clearLogButtonIconLayer.contentsGravity = .resizeAspect
         clearLogButtonIconLayer.contentsScale = 2
 
-        processTimelineTitleLayer.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
-        processTimelineTitleLayer.fontSize = 12
-        processTimelineTitleLayer.contentsScale = 2
-        processTimelineTitleLayer.truncationMode = .end
-        processTimelineTitleLayer.string = "Processes"
-        processTimelineRangeLayer.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-        processTimelineRangeLayer.fontSize = 11
-        processTimelineRangeLayer.contentsScale = 2
-        processTimelineRangeLayer.alignmentMode = .right
-        processTimelineRangeLayer.truncationMode = .end
         processTimelineEmptyLayer.font = NSFont.systemFont(ofSize: 12, weight: .regular)
         processTimelineEmptyLayer.fontSize = 12
         processTimelineEmptyLayer.contentsScale = 2
@@ -1065,20 +1049,21 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                                        y: timelineHeight + tableHeight - headerHeight,
                                        width: max(scrollbarX - horizontalInset - 8, 1),
                                        height: headerHeight)
-            let scale = max(headerLayer.contentsScale, 1)
-            let borderHeight = max(1 / scale, 0.5)
-            headerBorderLayer.frame = CGRect(x: headerLayer.frame.minX,
+            let borderHeight = horizontalDividerHeight()
+            headerBorderLayer.frame = CGRect(x: 0,
                                              y: headerLayer.frame.minY - borderHeight,
-                                             width: headerLayer.frame.width,
+                                             width: width,
                                              height: borderHeight)
             rowsClipLayer.frame = CGRect(x: horizontalInset,
                                          y: 0,
                                          width: max(scrollbarX - horizontalInset - 8, 1),
                                          height: max(tableHeight - headerHeight, 1))
+            let tableScrollbarYOffset = min(scrollbarVerticalDividerPadding,
+                                             max(rowsClipLayer.bounds.height / 2, 0))
             scrollbarTrackLayer.frame = CGRect(x: scrollbarX,
-                                               y: 0,
+                                               y: tableScrollbarYOffset,
                                                width: scrollbarWidth,
-                                               height: rowsClipLayer.bounds.height)
+                                               height: max(rowsClipLayer.bounds.height - tableScrollbarYOffset * 2, 1))
 
             layoutColumnHeaders()
             updateRows()
@@ -1096,6 +1081,10 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             return min(max(contentHeight * 0.36, 88), max(contentHeight - 96, 64))
         }
         return min(max(floor(contentHeight * 0.30), processTimelineMinHeight), processTimelineMaxHeight)
+    }
+
+    private func horizontalDividerHeight() -> CGFloat {
+        max(1 / max(headerLayer.contentsScale, 1), 0.5)
     }
 
     private func layoutToolbarTitle() {
@@ -1127,13 +1116,15 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                                            y: (toolbarHeight - clearLogButtonSize.height) / 2,
                                            width: clearLogButtonSize.width,
                                            height: clearLogButtonSize.height)
-        clearLogButtonIconLayer.frame = clearLogButtonLayer.bounds.insetBy(dx: 3, dy: 3)
+        clearLogButtonIconLayer.frame = clearLogButtonLayer.bounds.insetBy(dx: toolbarButtonIconInset,
+                                                                           dy: toolbarButtonIconInset)
 
         pauseButtonLayer.frame = CGRect(x: max(clearLogButtonLayer.frame.minX - pauseButtonSize.width - 6, horizontalInset),
                                         y: (toolbarHeight - pauseButtonSize.height) / 2,
                                         width: pauseButtonSize.width,
                                         height: pauseButtonSize.height)
-        pauseButtonIconLayer.frame = pauseButtonLayer.bounds.insetBy(dx: 2, dy: 2)
+        pauseButtonIconLayer.frame = pauseButtonLayer.bounds.insetBy(dx: toolbarButtonIconInset,
+                                                                     dy: toolbarButtonIconInset)
 
         filterPanelLayer.frame = CGRect(x: max(width - trailingControlInset - filterPanelSize.width - scrollbarWidth - 4, horizontalInset),
                                         y: max(pillY - filterPanelSize.height - 6, 8),
@@ -1190,47 +1181,42 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
 
     private func layoutScrollbar() {
         let viewportHeight = rowsClipLayer.bounds.height
+        let trackHeight = scrollbarTrackLayer.bounds.height
         let contentHeight = CGFloat(totalRows) * rowHeight
         let maxOffset = max(contentHeight - viewportHeight, 0)
         scrollbarTrackLayer.isHidden = maxOffset <= 0
         if maxOffset <= 0 {
-            scrollbarThumbLayer.frame = CGRect(x: 0, y: 0, width: scrollbarWidth, height: viewportHeight)
+            scrollbarThumbLayer.frame = CGRect(x: 0, y: 0, width: scrollbarWidth, height: trackHeight)
             return
         }
 
-        let thumbHeight = max((viewportHeight / contentHeight) * viewportHeight, 32)
-        let travel = max(viewportHeight - thumbHeight, 0)
-        let y = viewportHeight - thumbHeight - (scrollOffset / maxOffset) * travel
+        let thumbHeight = max((viewportHeight / contentHeight) * trackHeight, 32)
+        let travel = max(trackHeight - thumbHeight, 0)
+        let y = trackHeight - thumbHeight - (scrollOffset / maxOffset) * travel
         scrollbarThumbLayer.frame = CGRect(x: 0, y: y, width: scrollbarWidth, height: thumbHeight)
     }
 
     private func layoutProcessTimeline() {
         let bounds = processTimelineLayer.bounds
         let scrollbarX = bounds.width - scrollbarTrailingInset - scrollbarWidth
-        processTimelineHeaderLayer.frame = CGRect(x: horizontalInset,
-                                                  y: bounds.height - processTimelineHeaderHeight,
-                                                  width: max(scrollbarX - horizontalInset - 8, 1),
-                                                  height: processTimelineHeaderHeight)
-        processTimelineTitleLayer.frame = CGRect(x: 0,
-                                                 y: 7,
-                                                 width: min(processTimelineNameWidth, processTimelineHeaderLayer.bounds.width * 0.45),
-                                                 height: 16)
-        processTimelineRangeLayer.frame = CGRect(x: processTimelineTitleLayer.frame.maxX + 8,
-                                                 y: 7,
-                                                 width: max(processTimelineHeaderLayer.bounds.width - processTimelineTitleLayer.frame.maxX - 8, 1),
-                                                 height: 16)
+        let dividerHeight = horizontalDividerHeight()
+        processTimelineDividerLayer.frame = CGRect(x: 0,
+                                                   y: max(bounds.height - dividerHeight, 0),
+                                                   width: bounds.width,
+                                                   height: dividerHeight)
         processTimelineRowsClipLayer.frame = CGRect(x: horizontalInset,
                                                     y: 0,
                                                     width: max(scrollbarX - horizontalInset - 8, 1),
-                                                    height: max(bounds.height - processTimelineHeaderHeight, 1))
+                                                    height: max(bounds.height - dividerHeight, 1))
+        let timelineScrollbarTopPadding = min(scrollbarVerticalDividerPadding,
+                                              max(processTimelineRowsClipLayer.bounds.height / 2, 0))
         processTimelineScrollbarTrackLayer.frame = CGRect(x: scrollbarX,
                                                           y: 0,
                                                           width: scrollbarWidth,
-                                                          height: processTimelineRowsClipLayer.bounds.height)
+                                                          height: max(processTimelineRowsClipLayer.bounds.height - timelineScrollbarTopPadding, 1))
         updateTimelineRowLayerCount()
         layoutTimelineRows()
         layoutProcessTimelineScrollbar()
-        updateProcessTimelineHeaderText()
     }
 
     private func layoutTimelineRows() {
@@ -1496,17 +1482,18 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
 
     private func layoutProcessTimelineScrollbar() {
         let viewportHeight = processTimelineRowsClipLayer.bounds.height
+        let trackHeight = processTimelineScrollbarTrackLayer.bounds.height
         let contentHeight = CGFloat(processTimelineRows.count) * processTimelineRowHeight
         let maxOffset = max(contentHeight - viewportHeight, 0)
         processTimelineScrollbarTrackLayer.isHidden = maxOffset <= 0
         if maxOffset <= 0 {
-            processTimelineScrollbarThumbLayer.frame = CGRect(x: 0, y: 0, width: scrollbarWidth, height: viewportHeight)
+            processTimelineScrollbarThumbLayer.frame = CGRect(x: 0, y: 0, width: scrollbarWidth, height: trackHeight)
             return
         }
 
-        let thumbHeight = max((viewportHeight / contentHeight) * viewportHeight, 28)
-        let travel = max(viewportHeight - thumbHeight, 0)
-        let y = viewportHeight - thumbHeight - (processTimelineScrollOffset / maxOffset) * travel
+        let thumbHeight = max((viewportHeight / contentHeight) * trackHeight, 28)
+        let travel = max(trackHeight - thumbHeight, 0)
+        let y = trackHeight - thumbHeight - (processTimelineScrollOffset / maxOffset) * travel
         processTimelineScrollbarThumbLayer.frame = CGRect(x: 0, y: y, width: scrollbarWidth, height: thumbHeight)
     }
 
@@ -2194,6 +2181,9 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         processTimelineResponse = nil
         processTimelineRows = []
         processTimelineDotsByPID = [:]
+        processTimelineInFlight = false
+        pendingProcessTimelineFetchAfterInFlight = false
+        lastProcessTimelineRequestedEventCount = 0
         hoveredProcessTimelineDot = nil
         processTimelineHoveredDotLayer.path = nil
         processTimelineScrollOffset = 0
@@ -2769,6 +2759,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             clampScrollOffset()
             updateRows()
             updateLayout()
+            requestProcessTimelineRefreshIfNeeded(eventCount: UInt64(response.unfilteredTotal))
             let shouldRefetch = !responseCoversDesiredWindow(responseStart: responseStart, responseCount: response.count)
             pendingFetchAfterInFlight = false
             if shouldRefetch || hadPendingFetch {
@@ -2783,10 +2774,14 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     private func fetchProcessTimeline(force: Bool) {
         guard let processTimelineEndpoint,
               let urlSession else { return }
-        if processTimelineInFlight && !force {
+        if processTimelineInFlight {
+            if !force {
+                pendingProcessTimelineFetchAfterInFlight = true
+            }
             return
         }
 
+        pendingProcessTimelineFetchAfterInFlight = false
         processTimelineInFlight = true
         let requestGeneration = logGeneration
         urlSession.dataTask(with: processTimelineEndpoint) { [weak self] data, _, error in
@@ -2799,17 +2794,31 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         }.resume()
     }
 
+    private func requestProcessTimelineRefreshIfNeeded(eventCount: UInt64) {
+        guard eventCount != lastProcessTimelineRequestedEventCount else { return }
+        lastProcessTimelineRequestedEventCount = eventCount
+        fetchProcessTimeline(force: false)
+    }
+
     private func handleProcessTimelineFetchResult(data: Data?, errorText: String?, generation: Int) {
         guard generation == logGeneration else { return }
         processTimelineInFlight = false
+        let hadPendingFetch = pendingProcessTimelineFetchAfterInFlight
+        pendingProcessTimelineFetchAfterInFlight = false
         if let errorText {
             lastErrorText = errorText
             updateStatusText()
+            if hadPendingFetch {
+                fetchProcessTimeline(force: false)
+            }
             return
         }
         guard let data else {
             lastErrorText = "No process timeline response from backend"
             updateStatusText()
+            if hadPendingFetch {
+                fetchProcessTimeline(force: false)
+            }
             return
         }
 
@@ -2824,6 +2833,9 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         } catch {
             lastErrorText = "Could not decode process timeline response"
             updateStatusText()
+        }
+        if hadPendingFetch {
+            fetchProcessTimeline(force: false)
         }
     }
 
@@ -2993,17 +3005,6 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         }
     }
 
-    private func updateProcessTimelineHeaderText() {
-        withoutImplicitAnimations {
-            guard let response = processTimelineResponse else {
-                processTimelineRangeLayer.string = ""
-                return
-            }
-            let duration = max(response.captureEnd - response.captureStart, 0)
-            processTimelineRangeLayer.string = "\(formatCount(response.processCount)) processes over \(formatDuration(duration))"
-        }
-    }
-
     private func clampScrollOffset() {
         scrollOffset = min(max(scrollOffset, 0), maxScrollOffset())
     }
@@ -3055,18 +3056,17 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                 rootLayer.backgroundColor = NSColor.windowBackgroundColor.cgColor
                 tableLayer.backgroundColor = NSColor.windowBackgroundColor.cgColor
                 processTimelineLayer.backgroundColor = NSColor.windowBackgroundColor.cgColor
-                processTimelineHeaderLayer.backgroundColor = NSColor.controlBackgroundColor.cgColor
                 toolbarLayer.backgroundColor = NSColor.windowBackgroundColor.cgColor
                 headerLayer.backgroundColor = NSColor.controlBackgroundColor.cgColor
                 let controlBrightness = NSColor.controlBackgroundColor.usingColorSpace(.deviceRGB)?.brightnessComponent ?? 1
                 let isLightTheme = controlBrightness > 0.6
-                headerBorderLayer.backgroundColor = NSColor.separatorColor.withAlphaComponent(isLightTheme ? 0.35 : 0.6).cgColor
+                let dividerColor = NSColor.separatorColor.withAlphaComponent(isLightTheme ? 0.35 : 0.6).cgColor
+                headerBorderLayer.backgroundColor = dividerColor
                 rowsClipLayer.backgroundColor = NSColor.textBackgroundColor.cgColor
                 scrollbarTrackLayer.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.28).cgColor
                 scrollbarThumbLayer.backgroundColor = NSColor.secondaryLabelColor.withAlphaComponent(0.36).cgColor
                 processTimelineRowsClipLayer.backgroundColor = NSColor.textBackgroundColor.cgColor
-                processTimelineTitleLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
-                processTimelineRangeLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
+                processTimelineDividerLayer.backgroundColor = dividerColor
                 processTimelineEmptyLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
                 let eventDotAlphas: [CGFloat] = [0.44, 0.58, 0.72, 0.86]
                 for (index, dotLayer) in processTimelineEventDotLayers.enumerated() {
@@ -3122,7 +3122,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         appearance?.performAsCurrentDrawingAppearance {
             row.background.backgroundColor = NSColor.controlBackgroundColor.cgColor
             row.time.foregroundColor = NSColor.secondaryLabelColor.cgColor
-            row.type.foregroundColor = NSColor.controlAccentColor.cgColor
+            row.type.foregroundColor = NSColor.labelColor.cgColor
             row.pid.foregroundColor = NSColor.secondaryLabelColor.cgColor
             row.process.foregroundColor = NSColor.labelColor.cgColor
             row.path.foregroundColor = NSColor.labelColor.cgColor
@@ -3158,7 +3158,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                 tint = isCapturePaused ? NSColor.labelColor : NSColor.controlAccentColor
             }
             pauseButtonIconLayer.contents = makeSystemSymbolImage(systemSymbolName: symbolName,
-                                                                  pointSize: 22,
+                                                                  pointSize: toolbarButtonSymbolPointSize,
                                                                   weight: .regular,
                                                                   scale: max(pauseButtonIconLayer.contentsScale, 2),
                                                                   tintColor: tint,
@@ -3169,7 +3169,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     private func updateClearLogButtonAppearance() {
         appearance?.performAsCurrentDrawingAppearance {
             clearLogButtonIconLayer.contents = makeSystemSymbolImage(systemSymbolName: "xmark.circle",
-                                                                     pointSize: 21,
+                                                                     pointSize: toolbarButtonSymbolPointSize,
                                                                      weight: .regular,
                                                                      scale: max(clearLogButtonIconLayer.contentsScale, 2),
                                                                      tintColor: NSColor.secondaryLabelColor,
