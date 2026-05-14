@@ -98,7 +98,25 @@ private struct ProcessTimelineResponse {
     let captureEnd: Double
     let processCount: Int
     let eventCount: UInt64
+    let eventDotBucketCount: Int
+    let eventDotMaxCount: Int
+    let eventDots: [TimelineEventDot]
     let processes: [TimelineProcess]
+}
+
+private struct TimelineEventDot {
+    let pid: Int
+    let bucketIndex: Int
+    let count: Int
+    let timestamp: Double
+}
+
+private struct TimelineEventDotHit {
+    let pid: Int
+    let bucketIndex: Int
+    let count: Int
+    let timestamp: Double
+    let center: CGPoint
 }
 
 private struct TimelineProcess {
@@ -282,9 +300,13 @@ private func decodeProcessTimelineResponse(_ data: Data) throws -> ProcessTimeli
     let recordSize = Int(try data.traceUInt32(at: 28))
     let eventCount = try data.traceUInt64(at: 32)
     let totalProcessCountValue = headerSize >= 48 ? try data.traceUInt64(at: 40) : UInt64(processCount)
+    let dotCount = headerSize >= 64 ? Int(try data.traceUInt32(at: 48)) : 0
+    let dotRecordSize = headerSize >= 64 ? Int(try data.traceUInt32(at: 52)) : 0
+    let dotBucketCount = headerSize >= 64 ? Int(try data.traceUInt32(at: 56)) : 0
+    let dotMaxCount = headerSize >= 64 ? Int(try data.traceUInt32(at: 60)) : 0
 
     guard magic == 0x5043_5254,
-          version == 1,
+          version == 1 || version == 2 || version == 3,
           headerSize >= 48,
           recordSize >= 64,
           totalProcessCountValue <= UInt64(Int.max),
@@ -293,6 +315,34 @@ private func decodeProcessTimelineResponse(_ data: Data) throws -> ProcessTimeli
         throw TraceEventDecodeError.invalidFormat
     }
     let totalProcessCount = Int(totalProcessCountValue)
+    let processRecordsEnd = headerSize + processCount * recordSize
+    guard processRecordsEnd <= data.count else { throw TraceEventDecodeError.invalidFormat }
+
+    var eventDots: [TimelineEventDot] = []
+    if version >= 2 {
+        guard headerSize >= 64,
+              dotRecordSize >= 12,
+              dotCount >= 0,
+              dotBucketCount >= 0,
+              dotMaxCount >= 0,
+              dotCount <= (data.count - processRecordsEnd) / dotRecordSize else {
+            throw TraceEventDecodeError.invalidFormat
+        }
+        eventDots.reserveCapacity(dotCount)
+        let maxBucketIndex = max(dotBucketCount - 1, 1)
+        let duration = max(captureEnd - captureStart, 0.001)
+        for index in 0..<dotCount {
+            let offset = processRecordsEnd + index * dotRecordSize
+            let bucketIndex = Int(try data.traceUInt32(at: offset + 4))
+            let timestamp = dotRecordSize >= 20 ?
+                try data.traceDouble(at: offset + 12) :
+                captureStart + (Double(bucketIndex) / Double(maxBucketIndex)) * duration
+            eventDots.append(TimelineEventDot(pid: Int(try data.traceInt32(at: offset + 0)),
+                                              bucketIndex: bucketIndex,
+                                              count: Int(try data.traceUInt32(at: offset + 8)),
+                                              timestamp: timestamp))
+        }
+    }
 
     var processes: [TimelineProcess] = []
     processes.reserveCapacity(processCount)
@@ -315,6 +365,9 @@ private func decodeProcessTimelineResponse(_ data: Data) throws -> ProcessTimeli
                                    captureEnd: captureEnd,
                                    processCount: totalProcessCount,
                                    eventCount: eventCount,
+                                   eventDotBucketCount: dotBucketCount,
+                                   eventDotMaxCount: dotMaxCount,
+                                   eventDots: eventDots,
                                    processes: processes)
 }
 
@@ -413,6 +466,13 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     private let processTimelineTitleLayer = CATextLayer()
     private let processTimelineRangeLayer = CATextLayer()
     private let processTimelineRowsClipLayer = CALayer()
+    private let processTimelineEventDotLayers: [CAShapeLayer] = [
+        CAShapeLayer(),
+        CAShapeLayer(),
+        CAShapeLayer(),
+        CAShapeLayer()
+    ]
+    private let processTimelineHoveredDotLayer = CAShapeLayer()
     private let processTimelineEmptyLayer = CATextLayer()
     private let processTimelineScrollbarTrackLayer = CALayer()
     private let processTimelineScrollbarThumbLayer = CALayer()
@@ -470,6 +530,8 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     private var lastProcessTimelinePollTime: CFTimeInterval = 0
     private var processTimelineResponse: ProcessTimelineResponse?
     private var processTimelineRows: [TimelineProcessRow] = []
+    private var processTimelineDotsByPID: [Int: [TimelineEventDot]] = [:]
+    private var hoveredProcessTimelineDot: TimelineEventDotHit?
     private var processTimelineScrollOffset: CGFloat = 0
     private var isDraggingProcessTimelineScrollbar = false
     private var processTimelineScrollbarDragOffset: CGFloat = 0
@@ -554,6 +616,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                 processTimelineScrollOffset -= delta.y * multiplier
                 clampProcessTimelineScrollOffset()
                 updateLayout()
+                updateHoveredProcessTimelineDot(at: point)
                 return
             }
             guard rowsClipLayer.frame.contains(tableLayer.convert(point, from: rootLayer)) else { return }
@@ -576,11 +639,15 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             if !handleProcessTimelineScrollbarMouseDragged(to: point) {
                 _ = handleScrollbarMouseDragged(to: point)
             }
+            updateHoveredProcessTimelineDot(at: point)
 
         case .mouseUp(let point, _):
             if !handleProcessTimelineScrollbarMouseUp(at: point) {
                 _ = handleScrollbarMouseUp(at: point)
             }
+
+        case .mouseMoved(let point, _):
+            updateHoveredProcessTimelineDot(at: point)
 
         case .rightMouseDown(let point, _, _):
             handleCellContextMenu(at: point)
@@ -698,6 +765,14 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         processTimelineLayer.addSublayer(processTimelineScrollbarTrackLayer)
         processTimelineHeaderLayer.addSublayer(processTimelineTitleLayer)
         processTimelineHeaderLayer.addSublayer(processTimelineRangeLayer)
+        for dotLayer in processTimelineEventDotLayers {
+            dotLayer.zPosition = 5
+            dotLayer.contentsScale = 2
+            processTimelineRowsClipLayer.addSublayer(dotLayer)
+        }
+        processTimelineHoveredDotLayer.zPosition = 6
+        processTimelineHoveredDotLayer.contentsScale = 2
+        processTimelineRowsClipLayer.addSublayer(processTimelineHoveredDotLayer)
         processTimelineRowsClipLayer.addSublayer(processTimelineEmptyLayer)
         processTimelineScrollbarTrackLayer.addSublayer(processTimelineScrollbarThumbLayer)
         rootLayer.addSublayer(filterPillLayer)
@@ -1080,6 +1155,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         let startTime = processTimelineResponse?.captureStart ?? 0
         let endTime = max(processTimelineResponse?.captureEnd ?? startTime, startTime + 0.001)
         let duration = max(endTime - startTime, 0.001)
+        let visibleTimelineRowCount = min(timelineRowLayers.count, max(processTimelineRows.count - visibleStart, 0))
 
         for (layerIndex, row) in timelineRowLayers.enumerated() {
             let processIndex = visibleStart + layerIndex
@@ -1131,9 +1207,206 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                     .cgColor
             }
         }
+        layoutTimelineEventDots(timelineX: timelineX,
+                                timelineWidth: timelineWidth,
+                                visibleRowCount: visibleTimelineRowCount)
+        layoutHoveredProcessTimelineDot()
 
         processTimelineEmptyLayer.isHidden = !processTimelineRows.isEmpty
         processTimelineEmptyLayer.frame = processTimelineRowsClipLayer.bounds.insetBy(dx: 16, dy: max(processTimelineRowsClipLayer.bounds.height / 2 - 10, 0))
+    }
+
+    private func layoutTimelineEventDots(timelineX: CGFloat,
+                                         timelineWidth: CGFloat,
+                                         visibleRowCount: Int) {
+        guard let response = processTimelineResponse,
+              response.eventDotBucketCount > 0,
+              response.eventDotMaxCount > 0,
+              !response.eventDots.isEmpty,
+              visibleRowCount > 0,
+              timelineWidth > 0 else {
+            for layer in processTimelineEventDotLayers {
+                layer.path = nil
+            }
+            hoveredProcessTimelineDot = nil
+            processTimelineHoveredDotLayer.path = nil
+            return
+        }
+
+        let paths = processTimelineEventDotLayers.map { _ in CGMutablePath() }
+        let maxCount = max(response.eventDotMaxCount, 1)
+        let radius: CGFloat = 1.9
+        let startTime = response.captureStart
+        let endTime = max(response.captureEnd, startTime + 0.001)
+        let duration = max(endTime - startTime, 0.001)
+
+        let visibleStart = processTimelineVisibleStartIndex()
+        var visibleRowByPID: [Int: Int] = [:]
+        visibleRowByPID.reserveCapacity(visibleRowCount)
+        for layerIndex in 0..<visibleRowCount {
+            let processIndex = visibleStart + layerIndex
+            guard processIndex >= 0 && processIndex < processTimelineRows.count else { continue }
+            visibleRowByPID[processTimelineRows[processIndex].process.pid] = layerIndex
+        }
+
+        for dot in response.eventDots where dot.count > 0 {
+            guard dot.bucketIndex >= 0 && dot.bucketIndex < response.eventDotBucketCount,
+                  let layerIndex = visibleRowByPID[dot.pid] else { continue }
+            let normalized = CGFloat((dot.timestamp - startTime) / duration)
+            let x = timelineX + min(max(normalized, 0), 1) * timelineWidth
+            let cappedCount = min(max(dot.count, 1), maxCount)
+            let band = min(max((cappedCount - 1) * processTimelineEventDotLayers.count / maxCount, 0),
+                           processTimelineEventDotLayers.count - 1)
+            let rowCenterY = processTimelineRowsClipLayer.bounds.height -
+                CGFloat(layerIndex + 1) * processTimelineRowHeight +
+                processTimelineRowHeight / 2
+            paths[band].addEllipse(in: CGRect(x: x - radius,
+                                              y: rowCenterY - radius,
+                                              width: radius * 2,
+                                              height: radius * 2))
+        }
+
+        for (index, layer) in processTimelineEventDotLayers.enumerated() {
+            layer.frame = processTimelineRowsClipLayer.bounds
+            layer.path = paths[index]
+        }
+    }
+
+    private func nearestProcessTimelineDot(at point: CGPoint) -> TimelineEventDotHit? {
+        guard let response = processTimelineResponse,
+              response.eventDotBucketCount > 0,
+              !processTimelineDotsByPID.isEmpty else {
+            return nil
+        }
+
+        let timelinePoint = processTimelineRowsClipLayer.convert(point, from: rootLayer)
+        guard processTimelineRowsClipLayer.bounds.contains(timelinePoint) else {
+            return nil
+        }
+
+        let timelineWidth = max(processTimelineRowsClipLayer.bounds.width - processTimelineNameWidth - processTimelinePIDWidth - processTimelineEventsWidth - 24, 24)
+        let timelineX = processTimelineNameWidth + processTimelinePIDWidth + processTimelineEventsWidth + 18
+        guard timelinePoint.x >= timelineX - 12,
+              timelinePoint.x <= timelineX + timelineWidth + 12 else {
+            return nil
+        }
+
+        let visibleStart = processTimelineVisibleStartIndex()
+        let visibleCount = min(timelineRowLayers.count, max(processTimelineRows.count - visibleStart, 0))
+        guard visibleCount > 0 else { return nil }
+
+        let startTime = response.captureStart
+        let endTime = max(response.captureEnd, startTime + 0.001)
+        let duration = max(endTime - startTime, 0.001)
+        var bestHit: TimelineEventDotHit?
+        var bestDistanceSquared = CGFloat.greatestFiniteMagnitude
+        let maxDistance: CGFloat = 14
+        let maxDistanceSquared = maxDistance * maxDistance
+
+        for layerIndex in 0..<visibleCount {
+            let processIndex = visibleStart + layerIndex
+            guard processIndex >= 0 && processIndex < processTimelineRows.count else { continue }
+            let pid = processTimelineRows[processIndex].process.pid
+            guard let dots = processTimelineDotsByPID[pid] else { continue }
+            let rowCenterY = processTimelineRowsClipLayer.bounds.height -
+                CGFloat(layerIndex + 1) * processTimelineRowHeight +
+                processTimelineRowHeight / 2
+
+            for dot in dots where dot.count > 0 {
+                guard dot.bucketIndex >= 0 && dot.bucketIndex < response.eventDotBucketCount else { continue }
+                let normalized = CGFloat((dot.timestamp - startTime) / duration)
+                let center = CGPoint(x: timelineX + min(max(normalized, 0), 1) * timelineWidth,
+                                     y: rowCenterY)
+                let dx = center.x - timelinePoint.x
+                let dy = center.y - timelinePoint.y
+                let distanceSquared = dx * dx + dy * dy
+                guard distanceSquared < bestDistanceSquared else { continue }
+
+                bestDistanceSquared = distanceSquared
+                bestHit = TimelineEventDotHit(pid: pid,
+                                              bucketIndex: dot.bucketIndex,
+                                              count: dot.count,
+                                              timestamp: dot.timestamp,
+                                              center: center)
+            }
+        }
+
+        guard bestDistanceSquared <= maxDistanceSquared else { return nil }
+        return bestHit
+    }
+
+    private func processTimelineDotCenter(pid: Int, bucketIndex: Int, timestamp: Double) -> CGPoint? {
+        guard let response = processTimelineResponse,
+              response.eventDotBucketCount > 0,
+              bucketIndex >= 0,
+              bucketIndex < response.eventDotBucketCount else {
+            return nil
+        }
+
+        let timelineWidth = max(processTimelineRowsClipLayer.bounds.width - processTimelineNameWidth - processTimelinePIDWidth - processTimelineEventsWidth - 24, 24)
+        let timelineX = processTimelineNameWidth + processTimelinePIDWidth + processTimelineEventsWidth + 18
+        let visibleStart = processTimelineVisibleStartIndex()
+        let visibleCount = min(timelineRowLayers.count, max(processTimelineRows.count - visibleStart, 0))
+        let startTime = response.captureStart
+        let endTime = max(response.captureEnd, startTime + 0.001)
+        let duration = max(endTime - startTime, 0.001)
+
+        for layerIndex in 0..<visibleCount {
+            let processIndex = visibleStart + layerIndex
+            guard processIndex >= 0 && processIndex < processTimelineRows.count else { continue }
+            guard processTimelineRows[processIndex].process.pid == pid else { continue }
+
+            let normalized = CGFloat((timestamp - startTime) / duration)
+            let rowCenterY = processTimelineRowsClipLayer.bounds.height -
+                CGFloat(layerIndex + 1) * processTimelineRowHeight +
+                processTimelineRowHeight / 2
+            return CGPoint(x: timelineX + min(max(normalized, 0), 1) * timelineWidth,
+                           y: rowCenterY)
+        }
+        return nil
+    }
+
+    private func updateHoveredProcessTimelineDot(at point: CGPoint) {
+        hoveredProcessTimelineDot = nearestProcessTimelineDot(at: point)
+        layoutHoveredProcessTimelineDot()
+    }
+
+    private func clickedProcessTimelineDot(at point: CGPoint) -> TimelineEventDotHit? {
+        let timelinePoint = processTimelineRowsClipLayer.convert(point, from: rootLayer)
+        if let hoveredProcessTimelineDot,
+           let center = processTimelineDotCenter(pid: hoveredProcessTimelineDot.pid,
+                                                 bucketIndex: hoveredProcessTimelineDot.bucketIndex,
+                                                 timestamp: hoveredProcessTimelineDot.timestamp) {
+            let dx = center.x - timelinePoint.x
+            let dy = center.y - timelinePoint.y
+            if dx * dx + dy * dy <= 18 * 18 {
+                return TimelineEventDotHit(pid: hoveredProcessTimelineDot.pid,
+                                           bucketIndex: hoveredProcessTimelineDot.bucketIndex,
+                                           count: hoveredProcessTimelineDot.count,
+                                           timestamp: hoveredProcessTimelineDot.timestamp,
+                                           center: center)
+            }
+        }
+        return nearestProcessTimelineDot(at: point)
+    }
+
+    private func layoutHoveredProcessTimelineDot() {
+        guard let hoveredProcessTimelineDot,
+              let center = processTimelineDotCenter(pid: hoveredProcessTimelineDot.pid,
+                                                    bucketIndex: hoveredProcessTimelineDot.bucketIndex,
+                                                    timestamp: hoveredProcessTimelineDot.timestamp) else {
+            processTimelineHoveredDotLayer.path = nil
+            return
+        }
+
+        let radius = CGFloat(min(max(4 + hoveredProcessTimelineDot.count / 4, 5), 8))
+        let path = CGMutablePath()
+        path.addEllipse(in: CGRect(x: center.x - radius,
+                                   y: center.y - radius,
+                                   width: radius * 2,
+                                   height: radius * 2))
+        processTimelineHoveredDotLayer.frame = processTimelineRowsClipLayer.bounds
+        processTimelineHoveredDotLayer.path = path
     }
 
     private func layoutProcessTimelineScrollbar() {
@@ -1242,13 +1515,22 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             return false
         }
 
+        if let dot = clickedProcessTimelineDot(at: point) {
+            hoveredProcessTimelineDot = dot
+            layoutHoveredProcessTimelineDot()
+            jumpToEvent(for: dot.pid,
+                        nearTimestamp: dot.timestamp,
+                        bucketIndex: dot.bucketIndex)
+            return true
+        }
+
         let rowFromTop = Int(floor((processTimelineRowsClipLayer.bounds.height - timelinePoint.y) / processTimelineRowHeight))
         let processIndex = processTimelineVisibleStartIndex() + max(rowFromTop, 0)
         guard processIndex >= 0, processIndex < processTimelineRows.count else {
             return true
         }
 
-        jumpToFirstEvent(for: processTimelineRows[processIndex].process.pid)
+        jumpToEvent(for: processTimelineRows[processIndex].process.pid)
         return true
     }
 
@@ -1703,6 +1985,9 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         inFlightFilterKey = ""
         processTimelineResponse = nil
         processTimelineRows = []
+        processTimelineDotsByPID = [:]
+        hoveredProcessTimelineDot = nil
+        processTimelineHoveredDotLayer.path = nil
         processTimelineScrollOffset = 0
         updateRows()
         updateProcessTimelineRows()
@@ -2246,6 +2531,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             let response = try decodeProcessTimelineResponse(data)
             processTimelineResponse = response
             processTimelineRows = orderedTimelineRows(from: response.processes)
+            processTimelineDotsByPID = Dictionary(grouping: response.eventDots, by: \.pid)
             clampProcessTimelineScrollOffset()
             updateProcessTimelineRows()
             updateLayout()
@@ -2262,13 +2548,27 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         }
     }
 
-    private func jumpToFirstEvent(for pid: Int) {
+    private func jumpToEvent(for pid: Int,
+                             nearTimestamp timestamp: Double? = nil,
+                             bucketIndex: Int? = nil) {
         guard pid > 0,
               let eventPositionEndpoint,
               let urlSession else { return }
 
         var components = URLComponents(url: eventPositionEndpoint, resolvingAgainstBaseURL: false)
         var queryItems = [URLQueryItem(name: "pid", value: String(pid))]
+        if let timestamp {
+            queryItems.append(URLQueryItem(name: "time", value: String(timestamp)))
+        }
+        if let bucketIndex,
+           let response = processTimelineResponse,
+           bucketIndex >= 0,
+           bucketIndex < response.eventDotBucketCount {
+            queryItems.append(URLQueryItem(name: "bucket", value: String(bucketIndex)))
+            queryItems.append(URLQueryItem(name: "bucketCount", value: String(response.eventDotBucketCount)))
+            queryItems.append(URLQueryItem(name: "rangeStart", value: String(response.captureStart)))
+            queryItems.append(URLQueryItem(name: "rangeEnd", value: String(response.captureEnd)))
+        }
         queryItems.append(contentsOf: activeFilterQueryItems())
         components?.queryItems = queryItems
         guard let url = components?.url else { return }
@@ -2467,6 +2767,15 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                 processTimelineTitleLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
                 processTimelineRangeLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
                 processTimelineEmptyLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
+                let eventDotAlphas: [CGFloat] = [0.44, 0.58, 0.72, 0.86]
+                for (index, dotLayer) in processTimelineEventDotLayers.enumerated() {
+                    dotLayer.fillColor = NSColor.secondaryLabelColor
+                        .withAlphaComponent(eventDotAlphas[min(index, eventDotAlphas.count - 1)])
+                        .cgColor
+                }
+                processTimelineHoveredDotLayer.fillColor = NSColor.secondaryLabelColor.withAlphaComponent(0.92).cgColor
+                processTimelineHoveredDotLayer.strokeColor = nil
+                processTimelineHoveredDotLayer.lineWidth = 0
                 processTimelineScrollbarTrackLayer.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.28).cgColor
                 processTimelineScrollbarThumbLayer.backgroundColor = NSColor.secondaryLabelColor.withAlphaComponent(0.36).cgColor
                 titleLayer.foregroundColor = NSColor.labelColor.cgColor

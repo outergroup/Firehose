@@ -42,9 +42,12 @@
 #define EVENT_BINARY_RECORD_SIZE 64
 #define EVENT_BINARY_MAX_COUNT 512
 #define PROCESS_TIMELINE_BINARY_MAGIC 0x50435254u
-#define PROCESS_TIMELINE_BINARY_VERSION 1
-#define PROCESS_TIMELINE_BINARY_HEADER_SIZE 48
+#define PROCESS_TIMELINE_BINARY_VERSION 3
+#define PROCESS_TIMELINE_BINARY_HEADER_SIZE 64
 #define PROCESS_TIMELINE_BINARY_RECORD_SIZE 64
+#define PROCESS_TIMELINE_DOT_RECORD_SIZE 20
+#define PROCESS_TIMELINE_DOT_BUCKET_COUNT 512
+#define PROCESS_TIMELINE_DOT_MAX_COUNT 16
 #define EVENT_POSITION_BINARY_MAGIC 0x504a5254u
 #define EVENT_POSITION_BINARY_VERSION 1
 #define EVENT_POSITION_BINARY_HEADER_SIZE 40
@@ -116,6 +119,8 @@ typedef struct {
     double end_timestamp;
     double last_timestamp;
     uint64_t event_count;
+    uint8_t dot_counts[PROCESS_TIMELINE_DOT_BUCKET_COUNT];
+    double dot_timestamp_sums[PROCESS_TIMELINE_DOT_BUCKET_COUNT];
     bool has_start;
     bool has_end;
     bool open_at_start;
@@ -1840,7 +1845,21 @@ static bool build_process_timeline(ProcessTimeline *timeline,
     *capture_end_out = 0;
     *event_count_out = (uint64_t)g_events.count;
 
-    bool has_any_event = false;
+    bool has_any_event = g_events.count > 0;
+    if (has_any_event) {
+        TraceEvent first_event;
+        TraceEvent last_event;
+        if (!read_event_at_chronological_index(0, &first_event) ||
+            !read_event_at_chronological_index(g_events.count - 1, &last_event)) {
+            return false;
+        }
+        *capture_start_out = first_event.timestamp;
+        *capture_end_out = last_event.timestamp;
+        if (*capture_end_out < *capture_start_out) {
+            *capture_end_out = *capture_start_out;
+        }
+    }
+
     for (size_t i = 0; i < g_events.count; ++i) {
         TraceEvent event;
         if (!read_event_at_chronological_index(i, &event)) {
@@ -1848,14 +1867,9 @@ static bool build_process_timeline(ProcessTimeline *timeline,
             return false;
         }
 
-        if (!has_any_event) {
-            *capture_start_out = event.timestamp;
-            has_any_event = true;
-        }
         if (event.timestamp > *capture_end_out) {
             *capture_end_out = event.timestamp;
         }
-
         if (event.pid <= 0) {
             continue;
         }
@@ -1872,6 +1886,27 @@ static bool build_process_timeline(ProcessTimeline *timeline,
             if (!item) {
                 free_process_timeline(timeline);
                 return false;
+            }
+        }
+
+        if (has_any_event) {
+            double duration = *capture_end_out - *capture_start_out;
+            size_t bucket = 0;
+            if (duration > 0 && PROCESS_TIMELINE_DOT_BUCKET_COUNT > 1) {
+                double normalized = (event.timestamp - *capture_start_out) / duration;
+                if (normalized < 0) {
+                    normalized = 0;
+                } else if (normalized > 1) {
+                    normalized = 1;
+                }
+                bucket = (size_t)(normalized * (double)(PROCESS_TIMELINE_DOT_BUCKET_COUNT - 1));
+                if (bucket >= PROCESS_TIMELINE_DOT_BUCKET_COUNT) {
+                    bucket = PROCESS_TIMELINE_DOT_BUCKET_COUNT - 1;
+                }
+            }
+            if (item->dot_counts[bucket] < PROCESS_TIMELINE_DOT_MAX_COUNT) {
+                item->dot_timestamp_sums[bucket] += event.timestamp;
+                item->dot_counts[bucket]++;
             }
         }
 
@@ -1942,13 +1977,24 @@ static size_t build_process_timeline_binary(unsigned char **buffer_out) {
         return 0;
     }
 
-    if (timeline.count > UINT32_MAX) {
+    size_t dot_count = 0;
+    for (size_t item_index = 0; item_index < timeline.count; ++item_index) {
+        ProcessTimelineItem *item = &timeline.items[item_index];
+        for (size_t bucket = 0; bucket < PROCESS_TIMELINE_DOT_BUCKET_COUNT; ++bucket) {
+            if (item->dot_counts[bucket] > 0) {
+                dot_count++;
+            }
+        }
+    }
+
+    if (timeline.count > UINT32_MAX || dot_count > UINT32_MAX) {
         free_process_timeline(&timeline);
         return 0;
     }
 
     size_t fixed_size = PROCESS_TIMELINE_BINARY_HEADER_SIZE +
-                        timeline.count * PROCESS_TIMELINE_BINARY_RECORD_SIZE;
+                        timeline.count * PROCESS_TIMELINE_BINARY_RECORD_SIZE +
+                        dot_count * PROCESS_TIMELINE_DOT_RECORD_SIZE;
     size_t variable_size = 0;
     for (size_t i = 0; i < timeline.count; ++i) {
         variable_size += strlen(timeline.items[i].process);
@@ -1974,6 +2020,10 @@ static size_t build_process_timeline_binary(unsigned char **buffer_out) {
     write_uint32_le(buffer + 28, PROCESS_TIMELINE_BINARY_RECORD_SIZE);
     write_uint64_le(buffer + 32, event_count);
     write_uint64_le(buffer + 40, (uint64_t)timeline.count);
+    write_uint32_le(buffer + 48, (uint32_t)dot_count);
+    write_uint32_le(buffer + 52, PROCESS_TIMELINE_DOT_RECORD_SIZE);
+    write_uint32_le(buffer + 56, PROCESS_TIMELINE_DOT_BUCKET_COUNT);
+    write_uint32_le(buffer + 60, PROCESS_TIMELINE_DOT_MAX_COUNT);
 
     size_t variable_offset = fixed_size;
     for (size_t i = 0; i < timeline.count; ++i) {
@@ -2000,6 +2050,25 @@ static size_t build_process_timeline_binary(unsigned char **buffer_out) {
             free(buffer);
             free_process_timeline(&timeline);
             return 0;
+        }
+    }
+
+    size_t dot_index = 0;
+    for (size_t item_index = 0; item_index < timeline.count; ++item_index) {
+        ProcessTimelineItem *item = &timeline.items[item_index];
+        for (size_t bucket = 0; bucket < PROCESS_TIMELINE_DOT_BUCKET_COUNT; ++bucket) {
+            if (item->dot_counts[bucket] == 0) {
+                continue;
+            }
+            size_t record_offset = PROCESS_TIMELINE_BINARY_HEADER_SIZE +
+                                   timeline.count * PROCESS_TIMELINE_BINARY_RECORD_SIZE +
+                                   dot_index * PROCESS_TIMELINE_DOT_RECORD_SIZE;
+            write_uint32_le(buffer + record_offset + 0, (uint32_t)item->pid);
+            write_uint32_le(buffer + record_offset + 4, (uint32_t)bucket);
+            write_uint32_le(buffer + record_offset + 8, (uint32_t)item->dot_counts[bucket]);
+            write_double_le(buffer + record_offset + 12,
+                            item->dot_timestamp_sums[bucket] / (double)item->dot_counts[bucket]);
+            dot_index++;
         }
     }
 
@@ -2148,6 +2217,31 @@ static bool parse_size_query_value(const char *query, const char *name, size_t *
             unsigned long long value = strtoull(cursor + name_len + 1, &end, 10);
             if (errno == 0 && end && (*end == '\0' || *end == '&')) {
                 *out = (size_t)value;
+                return true;
+            }
+        }
+        cursor = strchr(cursor, '&');
+        if (!cursor) {
+            break;
+        }
+        cursor++;
+    }
+    return false;
+}
+
+static bool parse_double_query_value(const char *query, const char *name, double *out) {
+    if (!query || !name || !out) {
+        return false;
+    }
+    size_t name_len = strlen(name);
+    const char *cursor = query;
+    while (*cursor) {
+        if (strncmp(cursor, name, name_len) == 0 && cursor[name_len] == '=') {
+            errno = 0;
+            char *end = NULL;
+            double value = strtod(cursor + name_len + 1, &end);
+            if (errno == 0 && end && end != cursor + name_len + 1 && (*end == '\0' || *end == '&')) {
+                *out = value;
                 return true;
             }
         }
@@ -2437,7 +2531,16 @@ static void send_events_response(int fd, const char *query) {
     free(payload);
 }
 
-static size_t build_event_position_binary(int pid, const EventFilter *filter, unsigned char **buffer_out) {
+static size_t build_event_position_binary(int pid,
+                                          bool has_target_time,
+                                          double target_time,
+                                          bool has_target_bucket,
+                                          size_t target_bucket,
+                                          size_t target_bucket_count,
+                                          double target_range_start,
+                                          double target_range_end,
+                                          const EventFilter *filter,
+                                          unsigned char **buffer_out) {
     unsigned char *buffer = calloc(1, EVENT_POSITION_BINARY_HEADER_SIZE);
     if (!buffer) {
         return 0;
@@ -2448,6 +2551,7 @@ static size_t build_event_position_binary(int pid, const EventFilter *filter, un
     double timestamp = 0;
     uint32_t found = 0;
     size_t filtered_index = 0;
+    double best_distance = 0;
 
     if (pid > 0) {
         for (size_t i = 0; i < g_events.count; ++i) {
@@ -2460,11 +2564,39 @@ static size_t build_event_position_binary(int pid, const EventFilter *filter, un
                 continue;
             }
             if (event.pid == pid) {
-                index = (uint64_t)filtered_index;
-                event_id = event.id;
-                timestamp = event.timestamp;
-                found = 1;
-                break;
+                if (has_target_bucket) {
+                    double duration = target_range_end - target_range_start;
+                    size_t event_bucket = 0;
+                    if (duration > 0 && target_bucket_count > 1) {
+                        double normalized = (event.timestamp - target_range_start) / duration;
+                        if (normalized < 0) {
+                            normalized = 0;
+                        } else if (normalized > 1) {
+                            normalized = 1;
+                        }
+                        event_bucket = (size_t)(normalized * (double)(target_bucket_count - 1));
+                        if (event_bucket >= target_bucket_count) {
+                            event_bucket = target_bucket_count - 1;
+                        }
+                    }
+                    if (event_bucket != target_bucket) {
+                        filtered_index++;
+                        continue;
+                    }
+                }
+                double distance = event.timestamp >= target_time ?
+                    event.timestamp - target_time :
+                    target_time - event.timestamp;
+                if (!has_target_time || !found || distance < best_distance) {
+                    index = (uint64_t)filtered_index;
+                    event_id = event.id;
+                    timestamp = event.timestamp;
+                    found = 1;
+                    best_distance = distance;
+                    if (!has_target_time || distance == 0) {
+                        break;
+                    }
+                }
             }
             filtered_index++;
         }
@@ -2487,10 +2619,32 @@ static void send_event_position_response(int fd, const char *query) {
     size_t pid_value = 0;
     parse_size_query_value(query, "pid", &pid_value);
     int pid = pid_value <= (size_t)INT_MAX ? (int)pid_value : 0;
+    double target_time = 0;
+    bool has_target_time = parse_double_query_value(query, "time", &target_time);
+    size_t target_bucket = 0;
+    size_t target_bucket_count = 0;
+    double target_range_start = 0;
+    double target_range_end = 0;
+    bool has_target_bucket = parse_size_query_value(query, "bucket", &target_bucket) &&
+        parse_size_query_value(query, "bucketCount", &target_bucket_count) &&
+        parse_double_query_value(query, "rangeStart", &target_range_start) &&
+        parse_double_query_value(query, "rangeEnd", &target_range_end) &&
+        target_bucket_count > 0 &&
+        target_bucket < target_bucket_count &&
+        target_range_end >= target_range_start;
     EventFilter filter = parse_event_filter_query(query);
 
     unsigned char *payload = NULL;
-    size_t len = build_event_position_binary(pid, &filter, &payload);
+    size_t len = build_event_position_binary(pid,
+                                             has_target_time,
+                                             target_time,
+                                             has_target_bucket,
+                                             target_bucket,
+                                             target_bucket_count,
+                                             target_range_start,
+                                             target_range_end,
+                                             &filter,
+                                             &payload);
     if (len == 0) {
         send_text_response(fd, 500, "failed to build event position response\n");
         return;
