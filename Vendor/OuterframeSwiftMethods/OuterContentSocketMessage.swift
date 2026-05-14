@@ -864,6 +864,7 @@ enum ContentToBrowserMessage {
                 if item.isEnabled { flags |= 1 << 0 }
                 if item.isSeparator { flags |= 1 << 1 }
                 payload.append(uint8: flags)
+                payload.append(uint8: item.action.rawValue)
                 try payload.append(stringReference: item.id)
                 try payload.append(stringReference: item.title)
             }
@@ -1018,12 +1019,14 @@ enum ContentToBrowserMessage {
             items.reserveCapacity(Int(count))
             for _ in 0..<count {
                 guard let flags = cursor.readUInt8(),
+                      let actionRawValue = cursor.readUInt8(),
                       let id = cursor.readStringReference(),
                       let title = cursor.readStringReference() else {
                     throw OuterframeContentSocketMessageError.truncatedPayload
                 }
                 items.append(OuterframeContextMenuItem(id: id,
                                                        title: title,
+                                                       action: OuterframeContextMenuItemAction(rawValue: actionRawValue) ?? .contentCommand,
                                                        isEnabled: flags & (1 << 0) != 0,
                                                        isSeparator: flags & (1 << 1) != 0))
             }
@@ -1177,15 +1180,26 @@ struct OuterframeContentPasteboardItem: Sendable {
     }
 }
 
+public enum OuterframeContextMenuItemAction: UInt8, Sendable {
+    case contentCommand = 0
+    case standardCopy = 1
+}
+
 public struct OuterframeContextMenuItem: Sendable {
     public let id: String
     public let title: String
+    public let action: OuterframeContextMenuItemAction
     public let isEnabled: Bool
     public let isSeparator: Bool
 
-    public init(id: String, title: String, isEnabled: Bool = true, isSeparator: Bool = false) {
+    public init(id: String,
+                title: String,
+                action: OuterframeContextMenuItemAction = .contentCommand,
+                isEnabled: Bool = true,
+                isSeparator: Bool = false) {
         self.id = id
         self.title = title
+        self.action = action
         self.isEnabled = isEnabled
         self.isSeparator = isSeparator
     }

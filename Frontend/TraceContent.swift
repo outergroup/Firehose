@@ -194,6 +194,11 @@ private struct CellFilterContext {
     let value: String
 }
 
+private struct TableCellSelection {
+    let columnTitle: String
+    let value: String
+}
+
 private extension Data {
     func traceUInt16(at offset: Int) throws -> UInt16 {
         guard offset >= 0, offset + 2 <= count else { throw TraceEventDecodeError.invalidFormat }
@@ -525,6 +530,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     private var isSyncingFilterInput = false
     private var filterClauses: [FilterClause] = []
     private var pendingCellFilterContext: CellFilterContext?
+    private var selectedTableCell: TableCellSelection?
     private var isCapturePaused = false
     private var processTimelineInFlight = false
     private var lastProcessTimelinePollTime: CFTimeInterval = 0
@@ -630,7 +636,8 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             if !handleToolbarMouseDown(at: point),
                !handleFilterMouseDown(at: point, modifierFlags: modifierFlags, clickCount: clickCount) {
                 if !handleProcessTimelineScrollbarMouseDown(at: point),
-                   !handleProcessTimelineMouseDown(at: point) {
+                   !handleProcessTimelineMouseDown(at: point),
+                   !handleTableCellMouseDown(at: point) {
                     _ = handleScrollbarMouseDown(at: point)
                 }
             }
@@ -650,7 +657,9 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             updateHoveredProcessTimelineDot(at: point)
 
         case .rightMouseDown(let point, _, _):
-            handleCellContextMenu(at: point)
+            if !handleFilterContextMenu(at: point) {
+                handleCellContextMenu(at: point)
+            }
 
         case .contextMenuItemSelected(let menuID, let itemID):
             handleContextMenuSelection(menuID: menuID, itemID: itemID)
@@ -688,6 +697,13 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             } else {
                 setFilterPanelExpanded(false)
             }
+
+        case .copySelectedPasteboardRequest(let requestID):
+            outerframeHost.sendCopySelectedPasteboardResponse(requestID: requestID,
+                                                              items: pasteboardItemsForCopy())
+
+        case .pasteboardContentDelivered(let items):
+            handlePasteboardItemsForPaste(items)
 
         case .accessibilitySnapshotRequest(let requestID):
             outerframeHost.sendAccessibilitySnapshotResponse(requestID: requestID,
@@ -1534,6 +1550,19 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         return true
     }
 
+    private func handleTableCellMouseDown(at point: CGPoint) -> Bool {
+        guard let hit = tableCellHit(at: point),
+              !hit.value.isEmpty else {
+            selectedTableCell = nil
+            updateTextInputState()
+            return false
+        }
+
+        selectedTableCell = TableCellSelection(columnTitle: hit.columnTitle, value: hit.value)
+        updateTextInputState()
+        return true
+    }
+
     private func handleToolbarMouseDown(at point: CGPoint) -> Bool {
         let toolbarPoint = toolbarLayer.convert(point, from: rootLayer)
         if pauseButtonLayer.frame.insetBy(dx: -4, dy: -4).contains(toolbarPoint) {
@@ -1641,26 +1670,76 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     }
 
     private func handleCellContextMenu(at point: CGPoint) {
-        guard let hit = cellFilterHit(at: point),
-              !hit.value.isEmpty else {
+        guard let tableHit = tableCellHit(at: point),
+              !tableHit.value.isEmpty else {
+            return
+        }
+
+        selectedTableCell = TableCellSelection(columnTitle: tableHit.columnTitle, value: tableHit.value)
+        updateTextInputState()
+
+        guard let filterHit = cellFilterHit(at: point),
+              !filterHit.value.isEmpty else {
+            outerframeHost.showContextMenu(for: NSAttributedString(string: tableHit.value), at: point)
             return
         }
 
         let menuID = UUID()
         pendingCellFilterContext = CellFilterContext(menuID: menuID,
-                                                     column: hit.column,
-                                                     value: hit.value)
-        let value = displayValue(hit.value, maxLength: 80)
+                                                     column: filterHit.column,
+                                                     value: filterHit.value)
+        let value = displayValue(filterHit.value, maxLength: 80)
         outerframeHost.showContextMenu(
             menuID: menuID,
             items: [
                 OuterframeContextMenuItem(id: "include",
-                                          title: "Include \(hit.column.title) is \"\(value)\""),
+                                          title: "Include \(filterHit.column.title) is \"\(value)\""),
                 OuterframeContextMenuItem(id: "exclude",
-                                          title: "Exclude \(hit.column.title) is \"\(value)\"")
+                                          title: "Exclude \(filterHit.column.title) is \"\(value)\""),
+                OuterframeContextMenuItem(id: "copy-separator",
+                                          title: "",
+                                          isEnabled: false,
+                                          isSeparator: true),
+                OuterframeContextMenuItem(id: "copy",
+                                          title: "Copy",
+                                          action: .standardCopy)
             ],
             at: point
         )
+    }
+
+    private func handleFilterContextMenu(at point: CGPoint) -> Bool {
+        guard isFilterPanelExpanded,
+              filterPanelLayer.frame.contains(point) else {
+            return false
+        }
+
+        let panelPoint = filterPanelLayer.convert(point, from: rootLayer)
+        for index in 0..<min(filterClauses.count, maxFilterClauseRows) {
+            guard filterValueLayers[index].frame.insetBy(dx: -6, dy: -5).contains(panelPoint) ||
+                    filterRowLayers[index].frame.contains(panelPoint) else {
+                continue
+            }
+
+            activeFilterIndex = index
+            syncFilterInputToActiveClause(moveCursorToEnd: false)
+            if filterValueLayers[index].frame.insetBy(dx: -6, dy: -5).contains(panelPoint) {
+                let characterIndex = characterIndexForFilterValue(panelPoint: panelPoint, rowIndex: index)
+                if let range = filterInputController.selectionRange,
+                   range.contains(characterIndex) {
+                    // Preserve the existing selection for Copy/Cut and Services.
+                } else {
+                    filterInputController.setCursorPosition(characterIndex, modifySelection: false)
+                }
+            }
+            updateFilterText()
+            updateTextInputState()
+            let selectedText = filterInputController.selectedTextContent() ?? ""
+            outerframeHost.showContextMenu(for: NSAttributedString(string: selectedText), at: point)
+            return true
+        }
+
+        return true
     }
 
     private func handleContextMenuSelection(menuID: UUID, itemID: String) {
@@ -1684,6 +1763,28 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         }
     }
 
+    private func tableCellHit(at point: CGPoint) -> (columnTitle: String, value: String)? {
+        let pointInRows = rowsClipLayer.convert(point, from: rootLayer)
+        guard rowsClipLayer.bounds.contains(pointInRows) else { return nil }
+
+        let columnFrames = columnFrames(in: rowsClipLayer.bounds.width)
+        guard let columnIndex = columnFrames.firstIndex(where: { $0.contains(CGPoint(x: pointInRows.x, y: 0)) }),
+              columnIndex >= 0,
+              columnIndex < columns.count else {
+            return nil
+        }
+
+        for (rowIndex, row) in rowLayers.enumerated() where rowIndex < currentEvents.count {
+            guard !row.container.isHidden,
+                  row.container.frame.contains(pointInRows) else {
+                continue
+            }
+            let event = currentEvents[rowIndex]
+            return (columns[columnIndex].title, tableValue(for: event, columnIndex: columnIndex))
+        }
+        return nil
+    }
+
     private func cellFilterHit(at point: CGPoint) -> (column: FilterColumn, value: String)? {
         let pointInRows = rowsClipLayer.convert(point, from: rootLayer)
         guard rowsClipLayer.bounds.contains(pointInRows) else { return nil }
@@ -1702,6 +1803,18 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             return (column, filterValue(for: currentEvents[rowIndex], column: column))
         }
         return nil
+    }
+
+    private func tableValue(for event: TraceEvent, columnIndex: Int) -> String {
+        switch columnIndex {
+        case 0: return event.time
+        case 1: return event.type
+        case 2: return event.pid > 0 ? String(event.pid) : ""
+        case 3: return event.process
+        case 4: return event.path
+        case 5: return event.detail
+        default: return ""
+        }
     }
 
     private func filterColumnForVisibleColumn(at index: Int) -> FilterColumn? {
@@ -2036,7 +2149,10 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     }
 
     private func updateTextInputState() {
-        outerframeHost.setInputMode(isFilterPanelExpanded ? .textInput : .rawKeys)
+        let inputMode: OuterframeContentInputMode = isFilterPanelExpanded || selectedTableCell != nil ?
+            [.textInput, .rawKeys] :
+            .rawKeys
+        outerframeHost.setInputMode(inputMode)
         updateFilterSelectionLayer()
         guard isFilterPanelExpanded,
               activeFilterIndex >= 0,
@@ -2154,7 +2270,59 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     }
 
     private func updateEditingCapabilities() {
-        outerframeHost.setPasteboardCapabilities(filterInputController.currentEditingCapabilities())
+        if filterInputController.isFocused {
+            outerframeHost.setPasteboardCapabilities(filterInputController.currentEditingCapabilities())
+            return
+        }
+
+        let canCopyCell = selectedTableCell?.value.isEmpty == false
+        outerframeHost.setPasteboardCapabilities(
+            OuterframeContentEditingCapabilities(
+                canCopy: canCopyCell,
+                canCut: false,
+                acceptablePasteboardTypeIdentifiers: []
+            )
+        )
+    }
+
+    private func pasteboardItemsForCopy() -> [OuterframeContentPasteboardItem] {
+        if filterInputController.isFocused,
+           let selectedText = filterInputController.selectedTextContent(),
+           !selectedText.isEmpty {
+            return stringPasteboardItems(for: selectedText)
+        }
+
+        if let selectedTableCell,
+           !selectedTableCell.value.isEmpty {
+            return stringPasteboardItems(for: selectedTableCell.value)
+        }
+
+        return []
+    }
+
+    private func handlePasteboardItemsForPaste(_ items: [OuterframeContentPasteboardItem]) {
+        guard filterInputController.isFocused else { return }
+
+        for item in items {
+            if item.typeIdentifier == NSPasteboard.PasteboardType.string.rawValue,
+               let stringValue = String(data: item.data, encoding: .utf8) {
+                filterInputController.insertText(stringValue)
+                return
+            }
+
+            if item.typeIdentifier == NSPasteboard.PasteboardType.rtf.rawValue,
+               let attributed = try? NSAttributedString(data: item.data,
+                                                        options: [.documentType: NSAttributedString.DocumentType.rtf],
+                                                        documentAttributes: nil) {
+                filterInputController.insertText(attributed.string)
+                return
+            }
+        }
+    }
+
+    private func stringPasteboardItems(for value: String) -> [OuterframeContentPasteboardItem] {
+        [OuterframeContentPasteboardItem(typeIdentifier: NSPasteboard.PasteboardType.string.rawValue,
+                                         data: Data(value.utf8))]
     }
 
     private func activeFilterValue() -> String {
