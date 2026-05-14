@@ -151,6 +151,17 @@ typedef struct {
 
 typedef struct {
     int pid;
+    int tid;
+    char path[EVENT_PATH_LEN];
+} PendingOpenEntry;
+
+typedef struct {
+    PendingOpenEntry *items;
+    size_t count;
+} PendingOpenTable;
+
+typedef struct {
+    int pid;
     int ppid;
 } ProcessParentEntry;
 
@@ -191,6 +202,7 @@ static EventStore g_events = {0};
 static ProcessSnapshot g_previous_snapshot = {0};
 static bool g_has_previous_snapshot = false;
 static FdPathTable g_fd_paths = {0};
+static PendingOpenTable g_pending_opens = {0};
 static ProcessParentTable g_process_parents = {0};
 static bool g_capture_paused = false;
 static CapturePauseReason g_capture_pause_reason = CAPTURE_PAUSE_REASON_NONE;
@@ -235,6 +247,12 @@ static bool append_process(ProcessSnapshot *snapshot, ProcessInfo process) {
 }
 
 static void fd_path_table_free(FdPathTable *table) {
+    free(table->items);
+    table->items = NULL;
+    table->count = 0;
+}
+
+static void pending_open_table_free(PendingOpenTable *table) {
     free(table->items);
     table->items = NULL;
     table->count = 0;
@@ -346,6 +364,61 @@ static TRACE_UNUSED void fd_path_copy_pid(int parent_pid, int child_pid) {
             fd_path_set(child_pid, g_fd_paths.items[i].fd, g_fd_paths.items[i].path);
         }
     }
+}
+
+static PendingOpenEntry *pending_open_find(int pid, int tid) {
+    for (size_t i = 0; i < g_pending_opens.count; ++i) {
+        if (g_pending_opens.items[i].pid == pid && g_pending_opens.items[i].tid == tid) {
+            return &g_pending_opens.items[i];
+        }
+    }
+    return NULL;
+}
+
+static TRACE_UNUSED void pending_open_set(int pid, int tid, const char *path) {
+    if (pid <= 0 || tid <= 0 || !path || path[0] == '\0') {
+        return;
+    }
+    PendingOpenEntry *entry = pending_open_find(pid, tid);
+    if (!entry) {
+        PendingOpenEntry *next = realloc(g_pending_opens.items,
+                                         sizeof(PendingOpenEntry) * (g_pending_opens.count + 1));
+        if (!next) {
+            return;
+        }
+        g_pending_opens.items = next;
+        entry = &g_pending_opens.items[g_pending_opens.count++];
+        memset(entry, 0, sizeof(*entry));
+        entry->pid = pid;
+        entry->tid = tid;
+    }
+    snprintf(entry->path, sizeof(entry->path), "%s", path);
+}
+
+static TRACE_UNUSED bool pending_open_take(int pid, int tid, char *out, size_t out_size) {
+    if (out_size == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    for (size_t i = 0; i < g_pending_opens.count; ++i) {
+        if (g_pending_opens.items[i].pid == pid && g_pending_opens.items[i].tid == tid) {
+            snprintf(out, out_size, "%s", g_pending_opens.items[i].path);
+            g_pending_opens.items[i] = g_pending_opens.items[g_pending_opens.count - 1];
+            g_pending_opens.count--;
+            return out[0] != '\0';
+        }
+    }
+    return false;
+}
+
+static TRACE_UNUSED void pending_open_remove_pid(int pid) {
+    size_t out = 0;
+    for (size_t i = 0; i < g_pending_opens.count; ++i) {
+        if (g_pending_opens.items[i].pid != pid) {
+            g_pending_opens.items[out++] = g_pending_opens.items[i];
+        }
+    }
+    g_pending_opens.count = out;
 }
 
 static bool read_proc_fd_path(int pid, int fd, char *out, size_t out_size) {
@@ -551,6 +624,8 @@ static bool capture_process_snapshot(ProcessSnapshot *snapshot) {
 #define TRACE_BPF_EVENT_CLOSE 6
 #define TRACE_BPF_EVENT_READ 7
 #define TRACE_BPF_EVENT_WRITE 8
+#define TRACE_BPF_EVENT_OPENAT_RET 9
+#define TRACE_BPF_EVENT_OPENAT2_RET 10
 #define TRACE_BPF_EVENT_SIZE 184
 #define TRACE_BPF_STACK_OFF (-192)
 #define TRACE_BPF_FORK_PARENT_PID_OFFSET 24
@@ -565,7 +640,7 @@ typedef struct {
     uint32_t event_type;
     int32_t pid;
     int32_t ppid;
-    uint32_t reserved;
+    int32_t tid;
     uint64_t arg0;
     uint64_t arg1;
     char comm[16];
@@ -728,6 +803,7 @@ static int load_fork_bpf_program(int map_fd, int output_cpu, ForkTracepointOffse
     insns[count++] = TRACE_BPF_ST_MEM(BPF_W, BPF_REG_10, TRACE_BPF_STACK_OFF + 8, TRACE_BPF_EVENT_FORK);
     insns[count++] = TRACE_BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_6, offsets.child_pid);
     insns[count++] = TRACE_BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_2, TRACE_BPF_STACK_OFF + 12);
+    insns[count++] = TRACE_BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_2, TRACE_BPF_STACK_OFF + 20);
     insns[count++] = TRACE_BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_6, offsets.parent_pid);
     insns[count++] = TRACE_BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_2, TRACE_BPF_STACK_OFF + 16);
     for (int i = 0; i < 16; i += 4) {
@@ -749,6 +825,7 @@ static int load_exit_bpf_program(int map_fd, int output_cpu, char *error, size_t
     insns[count++] = TRACE_BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_0, TRACE_BPF_STACK_OFF + 0);
     insns[count++] = TRACE_BPF_ST_MEM(BPF_W, BPF_REG_10, TRACE_BPF_STACK_OFF + 8, TRACE_BPF_EVENT_EXIT);
     insns[count++] = TRACE_BPF_EMIT_CALL(BPF_FUNC_get_current_pid_tgid);
+    insns[count++] = TRACE_BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_0, TRACE_BPF_STACK_OFF + 20);
     insns[count++] = TRACE_BPF_ALU64_IMM(BPF_RSH, BPF_REG_0, 32);
     insns[count++] = TRACE_BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_0, TRACE_BPF_STACK_OFF + 12);
     insns[count++] = TRACE_BPF_MOV64_REG(BPF_REG_1, BPF_REG_10);
@@ -772,6 +849,7 @@ static int load_syscall_bpf_program(int map_fd, int output_cpu, uint32_t event_t
     insns[count++] = TRACE_BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_0, TRACE_BPF_STACK_OFF + 0);
     insns[count++] = TRACE_BPF_ST_MEM(BPF_W, BPF_REG_10, TRACE_BPF_STACK_OFF + 8, (int32_t)event_type);
     insns[count++] = TRACE_BPF_EMIT_CALL(BPF_FUNC_get_current_pid_tgid);
+    insns[count++] = TRACE_BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_0, TRACE_BPF_STACK_OFF + 20);
     insns[count++] = TRACE_BPF_ALU64_IMM(BPF_RSH, BPF_REG_0, 32);
     insns[count++] = TRACE_BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_0, TRACE_BPF_STACK_OFF + 12);
     insns[count++] = TRACE_BPF_MOV64_REG(BPF_REG_1, BPF_REG_10);
@@ -1064,6 +1142,7 @@ static void consume_perf_ring(PerfRing *ring) {
                     add_event("process.fork", &process, "", detail);
                 } else if (bpf_event.event_type == TRACE_BPF_EVENT_EXIT) {
                     process.ppid = process_parent_lookup(process.pid);
+                    pending_open_remove_pid(process.pid);
                     fd_path_remove_pid(process.pid);
                     process_parent_remove(process.pid);
                     snprintf(detail, sizeof(detail), "Exited %s", process.name);
@@ -1071,6 +1150,7 @@ static void consume_perf_ring(PerfRing *ring) {
                 } else if (bpf_event.event_type == TRACE_BPF_EVENT_OPENAT) {
                     process.ppid = process_parent_lookup(process.pid);
                     snprintf(event_path, sizeof(event_path), "%s", bpf_event.text[0] ? bpf_event.text : "");
+                    pending_open_set(process.pid, bpf_event.tid, event_path);
                     snprintf(detail, sizeof(detail), "dfd=%lld flags=0x%llx path=%s",
                              (long long)bpf_event.arg0,
                              (unsigned long long)bpf_event.arg1,
@@ -1079,10 +1159,17 @@ static void consume_perf_ring(PerfRing *ring) {
                 } else if (bpf_event.event_type == TRACE_BPF_EVENT_OPENAT2) {
                     process.ppid = process_parent_lookup(process.pid);
                     snprintf(event_path, sizeof(event_path), "%s", bpf_event.text[0] ? bpf_event.text : "");
+                    pending_open_set(process.pid, bpf_event.tid, event_path);
                     snprintf(detail, sizeof(detail), "dfd=%lld path=%s",
                              (long long)bpf_event.arg0,
                              bpf_event.text[0] ? bpf_event.text : "(unavailable)");
                     add_event("file.openat2", &process, event_path, detail);
+                } else if (bpf_event.event_type == TRACE_BPF_EVENT_OPENAT_RET ||
+                           bpf_event.event_type == TRACE_BPF_EVENT_OPENAT2_RET) {
+                    int fd = (int64_t)bpf_event.arg0 >= 0 ? (int)bpf_event.arg0 : -1;
+                    if (pending_open_take(process.pid, bpf_event.tid, event_path, sizeof(event_path)) && fd >= 0) {
+                        fd_path_set(process.pid, fd, event_path);
+                    }
                 } else if (bpf_event.event_type == TRACE_BPF_EVENT_EXECVE) {
                     process.ppid = process_parent_lookup(process.pid);
                     snprintf(event_path, sizeof(event_path), "%s", bpf_event.text[0] ? bpf_event.text : "");
@@ -1266,12 +1353,20 @@ static bool start_ebpf_capture(EBPFCapture *capture, char *error, size_t error_s
     ForkTracepointOffsets fork_offsets = read_fork_tracepoint_offsets();
     SyscallTracepointOffsets openat_offsets = read_syscall_tracepoint_offsets("sys_enter_openat", "dfd", "flags", "filename");
     SyscallTracepointOffsets openat2_offsets = read_syscall_tracepoint_offsets("sys_enter_openat2", "dfd", NULL, "filename");
+    SyscallTracepointOffsets openat_ret_offsets = read_syscall_tracepoint_offsets("sys_exit_openat", "ret", NULL, NULL);
+    SyscallTracepointOffsets openat2_ret_offsets = read_syscall_tracepoint_offsets("sys_exit_openat2", "ret", NULL, NULL);
     SyscallTracepointOffsets execve_offsets = read_syscall_tracepoint_offsets("sys_enter_execve", NULL, NULL, "filename");
     SyscallTracepointOffsets close_offsets = read_syscall_tracepoint_offsets("sys_enter_close", "fd", NULL, NULL);
 #if TRACE_CAPTURE_RW_SYSCALLS
     SyscallTracepointOffsets read_offsets = read_syscall_tracepoint_offsets("sys_enter_read", "fd", "count", NULL);
     SyscallTracepointOffsets write_offsets = read_syscall_tracepoint_offsets("sys_enter_write", "fd", "count", NULL);
 #endif
+    if (openat_ret_offsets.arg0 < 0 || openat2_ret_offsets.arg0 < 0) {
+        snprintf(error, error_size, "could not read openat/openat2 syscall return tracepoint offsets");
+        stop_ebpf_capture(capture);
+        return false;
+    }
+
     for (int cpu = 0; cpu < capture->cpu_count; ++cpu) {
         int fork_prog_fd = load_fork_bpf_program(capture->perf_map_fd, cpu, fork_offsets, error, error_size);
         if (!load_and_attach_program(capture, "sched", "sched_process_fork", cpu, fork_prog_fd, error, error_size)) {
@@ -1292,6 +1387,18 @@ static bool start_ebpf_capture(EBPFCapture *capture, char *error, size_t error_s
         int openat2_prog_fd = load_syscall_bpf_program(capture->perf_map_fd, cpu, TRACE_BPF_EVENT_OPENAT2,
                                                        openat2_offsets, "trace_openat2", error, error_size);
         if (!load_and_attach_program(capture, "syscalls", "sys_enter_openat2", cpu, openat2_prog_fd, error, error_size)) {
+            stop_ebpf_capture(capture);
+            return false;
+        }
+        int openat_ret_prog_fd = load_syscall_bpf_program(capture->perf_map_fd, cpu, TRACE_BPF_EVENT_OPENAT_RET,
+                                                          openat_ret_offsets, "trace_openat_ret", error, error_size);
+        if (!load_and_attach_program(capture, "syscalls", "sys_exit_openat", cpu, openat_ret_prog_fd, error, error_size)) {
+            stop_ebpf_capture(capture);
+            return false;
+        }
+        int openat2_ret_prog_fd = load_syscall_bpf_program(capture->perf_map_fd, cpu, TRACE_BPF_EVENT_OPENAT2_RET,
+                                                           openat2_ret_offsets, "trace_openat2_ret", error, error_size);
+        if (!load_and_attach_program(capture, "syscalls", "sys_exit_openat2", cpu, openat2_ret_prog_fd, error, error_size)) {
             stop_ebpf_capture(capture);
             return false;
         }
@@ -1711,6 +1818,7 @@ static bool clear_capture_log(void) {
     free(g_fd_paths.items);
     g_fd_paths.items = NULL;
     g_fd_paths.count = 0;
+    pending_open_table_free(&g_pending_opens);
     process_parent_table_free(&g_process_parents);
 
     if (!event_store_clear(&g_events)) {
@@ -3087,6 +3195,7 @@ int main(int argc, char **argv) {
                 stop_ebpf_capture(&g_ebpf_capture);
                 event_store_close(&g_events);
                 fd_path_table_free(&g_fd_paths);
+                pending_open_table_free(&g_pending_opens);
                 process_parent_table_free(&g_process_parents);
                 return 1;
             }
@@ -3113,6 +3222,7 @@ int main(int argc, char **argv) {
         stop_ebpf_capture(&g_ebpf_capture);
         event_store_close(&g_events);
         fd_path_table_free(&g_fd_paths);
+        pending_open_table_free(&g_pending_opens);
         process_parent_table_free(&g_process_parents);
         return 1;
     }
@@ -3150,6 +3260,7 @@ int main(int argc, char **argv) {
     event_store_close(&g_events);
     free_process_snapshot(&g_previous_snapshot);
     fd_path_table_free(&g_fd_paths);
+    pending_open_table_free(&g_pending_opens);
     process_parent_table_free(&g_process_parents);
     return 0;
 }
