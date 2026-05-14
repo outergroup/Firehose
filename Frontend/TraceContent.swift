@@ -78,7 +78,24 @@ private struct TraceEventResponse {
     let unfilteredTotal: Int
     let start: Int
     let count: Int
+    let captureStatus: CaptureStatus
     let events: [TraceEvent]
+}
+
+private enum CapturePauseReason: UInt32 {
+    case none = 0
+    case user = 1
+    case lowStorage = 2
+}
+
+private struct CaptureStatus {
+    let isPaused: Bool
+    let pauseReason: CapturePauseReason
+    let storageStatusValid: Bool
+    let storageIsLow: Bool
+    let availableStorageBytes: UInt64
+    let storageThresholdBytes: UInt64
+    let totalStorageBytes: UInt64
 }
 
 private struct TraceEvent {
@@ -258,9 +275,14 @@ private func decodeTraceEventResponse(_ data: Data) throws -> TraceEventResponse
     let recordSize = Int(try data.traceUInt32(at: 28))
 
     let unfilteredTotal = headerSize >= 40 ? try data.traceUInt64(at: 32) : total
+    let captureFlags = headerSize >= 72 ? try data.traceUInt32(at: 40) : 0
+    let pauseReasonValue = headerSize >= 72 ? try data.traceUInt32(at: 44) : 0
+    let availableStorageBytes = headerSize >= 72 ? try data.traceUInt64(at: 48) : 0
+    let storageThresholdBytes = headerSize >= 72 ? try data.traceUInt64(at: 56) : 0
+    let totalStorageBytes = headerSize >= 72 ? try data.traceUInt64(at: 64) : 0
 
     guard magic == 0x4543_5254,
-          version == 1 || version == 2 || version == 3,
+          version == 1 || version == 2 || version == 3 || version == 4,
           headerSize >= 32,
           recordSize >= 56,
           total <= UInt64(Int.max),
@@ -292,7 +314,50 @@ private func decodeTraceEventResponse(_ data: Data) throws -> TraceEventResponse
                               unfilteredTotal: Int(unfilteredTotal),
                               start: Int(start),
                               count: eventCount,
+                              captureStatus: captureStatus(flags: captureFlags,
+                                                           pauseReasonValue: pauseReasonValue,
+                                                           availableStorageBytes: availableStorageBytes,
+                                                           storageThresholdBytes: storageThresholdBytes,
+                                                           totalStorageBytes: totalStorageBytes),
                               events: events)
+}
+
+private func captureStatus(flags: UInt32,
+                           pauseReasonValue: UInt32,
+                           availableStorageBytes: UInt64,
+                           storageThresholdBytes: UInt64,
+                           totalStorageBytes: UInt64) -> CaptureStatus {
+    CaptureStatus(isPaused: flags & (1 << 0) != 0,
+                  pauseReason: CapturePauseReason(rawValue: pauseReasonValue) ?? .none,
+                  storageStatusValid: flags & (1 << 1) != 0,
+                  storageIsLow: flags & (1 << 2) != 0,
+                  availableStorageBytes: availableStorageBytes,
+                  storageThresholdBytes: storageThresholdBytes,
+                  totalStorageBytes: totalStorageBytes)
+}
+
+private func decodeCaptureStatusResponse(_ data: Data) throws -> CaptureStatus {
+    let magic = try data.traceUInt32(at: 0)
+    let version = try data.traceUInt16(at: 4)
+    let headerSize = Int(try data.traceUInt16(at: 6))
+    let flags = try data.traceUInt32(at: 8)
+    let pauseReasonValue = try data.traceUInt32(at: 12)
+    let availableStorageBytes = try data.traceUInt64(at: 16)
+    let storageThresholdBytes = try data.traceUInt64(at: 24)
+    let totalStorageBytes = try data.traceUInt64(at: 32)
+
+    guard magic == 0x4353_5254,
+          version == 1,
+          headerSize >= 48,
+          headerSize <= data.count else {
+        throw TraceEventDecodeError.invalidFormat
+    }
+
+    return captureStatus(flags: flags,
+                         pauseReasonValue: pauseReasonValue,
+                         availableStorageBytes: availableStorageBytes,
+                         storageThresholdBytes: storageThresholdBytes,
+                         totalStorageBytes: totalStorageBytes)
 }
 
 private func decodeProcessTimelineResponse(_ data: Data) throws -> ProcessTimelineResponse {
@@ -532,6 +597,8 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     private var pendingCellFilterContext: CellFilterContext?
     private var selectedTableCell: TableCellSelection?
     private var isCapturePaused = false
+    private var capturePauseReason: CapturePauseReason = .none
+    private var captureStorageStatus: CaptureStatus?
     private var processTimelineInFlight = false
     private var lastProcessTimelinePollTime: CFTimeInterval = 0
     private var processTimelineResponse: ProcessTimelineResponse?
@@ -557,6 +624,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     private let scrollbarTrailingInset: CGFloat = 4
     private let scrollbarHitSlop: CGFloat = 5
     private let overscanScreens: CGFloat = 2
+    private let renderedRowOverscan: Int = 8
     private let maxPrefetchRows = 512
     private let minPrefetchRows = 120
     private let filterPillSize = CGSize(width: 260, height: 28)
@@ -1013,7 +1081,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                                                height: rowsClipLayer.bounds.height)
 
             layoutColumnHeaders()
-            updateRowLayerCount()
+            updateRows()
             layoutRows()
             layoutScrollbar()
             layoutProcessTimeline()
@@ -1102,8 +1170,9 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
 
     private func layoutRows() {
         let frames = columnFrames(in: rowsClipLayer.bounds.width)
+        let renderedStart = renderedRowRange().start
         for (index, row) in rowLayers.enumerated() {
-            let globalIndex = currentWindowStart + index
+            let globalIndex = renderedStart + index
             let rowTopFromViewportTop = CGFloat(globalIndex) * rowHeight - scrollOffset
             row.container.frame = CGRect(x: 0,
                                          y: rowsClipLayer.bounds.height - rowTopFromViewportTop - rowHeight,
@@ -1774,13 +1843,13 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             return nil
         }
 
-        for (rowIndex, row) in rowLayers.enumerated() where rowIndex < currentEvents.count {
+        for (rowIndex, row) in rowLayers.enumerated() {
             guard !row.container.isHidden,
-                  row.container.frame.contains(pointInRows) else {
+                  row.container.frame.contains(pointInRows),
+                  let renderedRow = eventForRenderedRow(at: rowIndex) else {
                 continue
             }
-            let event = currentEvents[rowIndex]
-            return (columns[columnIndex].title, tableValue(for: event, columnIndex: columnIndex))
+            return (columns[columnIndex].title, tableValue(for: renderedRow.event, columnIndex: columnIndex))
         }
         return nil
     }
@@ -1795,12 +1864,13 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             return nil
         }
 
-        for (rowIndex, row) in rowLayers.enumerated() where rowIndex < currentEvents.count {
+        for (rowIndex, row) in rowLayers.enumerated() {
             guard !row.container.isHidden,
-                  row.container.frame.contains(pointInRows) else {
+                  row.container.frame.contains(pointInRows),
+                  let renderedRow = eventForRenderedRow(at: rowIndex) else {
                 continue
             }
-            return (column, filterValue(for: currentEvents[rowIndex], column: column))
+            return (column, filterValue(for: renderedRow.event, column: column))
         }
         return nil
     }
@@ -2003,6 +2073,14 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         fetchVisibleWindow(force: true)
     }
 
+    private func applyCaptureStatus(_ status: CaptureStatus) {
+        isCapturePaused = status.isPaused
+        capturePauseReason = status.pauseReason
+        captureStorageStatus = status
+        updateStatusText()
+        updateCaptureButtonAppearance()
+    }
+
     private func setCapturePaused(_ paused: Bool) {
         guard isCapturePaused != paused else { return }
         isCapturePaused = paused
@@ -2014,12 +2092,29 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         components?.queryItems = [URLQueryItem(name: "paused", value: paused ? "1" : "0")]
         guard let url = components?.url else { return }
 
-        urlSession.dataTask(with: url) { [weak self] _, _, error in
+        urlSession.dataTask(with: url) { [weak self] data, _, error in
             Task { @MainActor in
                 if let error {
                     self?.lastErrorText = error.localizedDescription
                     self?.updateStatusText()
                     self?.updateColors()
+                } else if let data {
+                    do {
+                        self?.lastErrorText = nil
+                        self?.applyCaptureStatus(try decodeCaptureStatusResponse(data))
+                        if paused {
+                            self?.fetchVisibleWindow(force: true)
+                        } else {
+                            self?.lastRequestedStart = -1
+                            self?.lastRequestedCount = -1
+                            self?.lastRequestedTail = false
+                            self?.fetchVisibleWindow(force: true)
+                        }
+                    } catch {
+                        self?.lastErrorText = "Could not decode binary capture response"
+                        self?.updateStatusText()
+                        self?.fetchVisibleWindow(force: true)
+                    }
                 } else if paused {
                     self?.lastErrorText = nil
                     self?.updateStatusText()
@@ -2404,12 +2499,13 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     }
 
     private func updateRowLayerCount() {
-        let needed = visibleRequestCount()
+        let range = renderedRowRange()
+        let needed = max(range.end - range.start, 1)
         while rowLayers.count < needed {
             rowLayers.append(makeRowLayers())
         }
         for (index, row) in rowLayers.enumerated() {
-            row.container.isHidden = index >= currentEvents.count
+            row.container.isHidden = index >= needed || eventForRenderedRow(at: index) == nil
         }
     }
 
@@ -2433,6 +2529,27 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         let start = max(Int(floor(offset / rowHeight)), 0)
         let end = max(Int(ceil((offset + viewportHeight) / rowHeight)), start + 1)
         return (start, end)
+    }
+
+    private func renderedRowRange() -> (start: Int, end: Int) {
+        let visible = visibleRowRange(for: scrollOffset)
+        let visibleCount = max(visible.end - visible.start, 1)
+        let overscan = max(renderedRowOverscan, visibleCount / 2)
+        let boundedTotal = max(totalRows, visible.end)
+        let start = max(visible.start - overscan, 0)
+        let end = min(max(visible.end + overscan, start + visibleCount), boundedTotal)
+        return (start, max(end, start + 1))
+    }
+
+    private func eventForRenderedRow(at index: Int) -> (globalIndex: Int, event: TraceEvent)? {
+        let renderedStart = renderedRowRange().start
+        let globalIndex = renderedStart + index
+        let eventIndex = globalIndex - currentWindowStart
+        guard eventIndex >= 0,
+              eventIndex < currentEvents.count else {
+            return nil
+        }
+        return (globalIndex, currentEvents[eventIndex])
     }
 
     private func visibleStartIndex() -> Int {
@@ -2642,6 +2759,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             let responseStart = response.start
             totalRows = response.total
             unfilteredRows = response.unfilteredTotal
+            applyCaptureStatus(response.captureStatus)
             if wasPinnedToBottom {
                 scrollOffset = maxScrollOffset()
             }
@@ -2824,11 +2942,11 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         withoutImplicitAnimations {
             updateRowLayerCount()
             for (index, row) in rowLayers.enumerated() {
-                guard index < currentEvents.count else {
+                guard let renderedRow = eventForRenderedRow(at: index) else {
                     row.container.isHidden = true
                     continue
                 }
-                let event = currentEvents[index]
+                let event = renderedRow.event
                 row.container.isHidden = false
                 row.time.string = event.time
                 row.type.string = event.type
@@ -2836,27 +2954,42 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                 row.process.string = event.process
                 row.path.string = event.path
                 row.detail.string = event.detail
-                row.background.opacity = ((currentWindowStart + index) % 2 == 0) ? 0.38 : 0
+                row.background.opacity = (renderedRow.globalIndex % 2 == 0) ? 0.38 : 0
             }
         }
     }
 
     private func updateStatusText() {
         withoutImplicitAnimations {
-            if let lastErrorText {
-                statusLayer.string = "Backend unavailable: \(lastErrorText)"
-                return
+            (appearance ?? NSAppearance.currentDrawing()).performAsCurrentDrawingAppearance {
+                if let lastErrorText {
+                    statusLayer.string = "Backend unavailable: \(lastErrorText)"
+                    statusLayer.foregroundColor = NSColor.systemRed.cgColor
+                    return
+                }
+                let shownRows = totalRows
+                let denominator = max(unfilteredRows, totalRows)
+                let percentage = denominator > 0 ? Int((Double(shownRows) / Double(denominator) * 100).rounded()) : 0
+                let processText: String
+                if let processTimelineResponse {
+                    processText = " - \(formatCount(processTimelineResponse.processCount)) processes"
+                } else {
+                    processText = ""
+                }
+                let baseText = "Showing \(formatCount(shownRows)) of \(formatCount(denominator)) events (\(percentage)%)\(processText)"
+                if let captureStorageStatus,
+                   captureStorageStatus.storageStatusValid,
+                   capturePauseReason == .lowStorage {
+                    statusLayer.string = "\(baseText) - Tracing paused: low storage (\(formatByteCount(captureStorageStatus.availableStorageBytes)) available)"
+                    statusLayer.foregroundColor = NSColor.systemOrange.cgColor
+                } else if isCapturePaused {
+                    statusLayer.string = "\(baseText) - Tracing paused"
+                    statusLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
+                } else {
+                    statusLayer.string = baseText
+                    statusLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
+                }
             }
-            let shownRows = totalRows
-            let denominator = max(unfilteredRows, totalRows)
-            let percentage = denominator > 0 ? Int((Double(shownRows) / Double(denominator) * 100).rounded()) : 0
-            let processText: String
-            if let processTimelineResponse {
-                processText = " - \(formatCount(processTimelineResponse.processCount)) processes"
-            } else {
-                processText = ""
-            }
-            statusLayer.string = "Showing \(formatCount(shownRows)) of \(formatCount(denominator)) events (\(percentage)%)\(processText)"
         }
     }
 
@@ -2947,7 +3080,6 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                 processTimelineScrollbarTrackLayer.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.28).cgColor
                 processTimelineScrollbarThumbLayer.backgroundColor = NSColor.secondaryLabelColor.withAlphaComponent(0.36).cgColor
                 titleLayer.foregroundColor = NSColor.labelColor.cgColor
-                statusLayer.foregroundColor = lastErrorText == nil ? NSColor.secondaryLabelColor.cgColor : NSColor.systemRed.cgColor
                 pauseButtonLayer.backgroundColor = NSColor.clear.cgColor
                 clearLogButtonLayer.backgroundColor = NSColor.clear.cgColor
                 filterPillLayer.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.94).cgColor
@@ -2973,6 +3105,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                 filterAddLayer.foregroundColor = NSColor.controlAccentColor.cgColor
                 updateFilterRowColors()
                 updateFilterValueColors()
+                updateStatusText()
                 updateCaptureButtonAppearance()
                 updateClearLogButtonAppearance()
                 for row in rowLayers {
@@ -3018,7 +3151,12 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     private func updateCaptureButtonAppearance() {
         appearance?.performAsCurrentDrawingAppearance {
             let symbolName = isCapturePaused ? "play.circle" : "pause.circle.fill"
-            let tint = isCapturePaused ? NSColor.labelColor : NSColor.controlAccentColor
+            let tint: NSColor
+            if capturePauseReason == .lowStorage {
+                tint = NSColor.systemOrange
+            } else {
+                tint = isCapturePaused ? NSColor.labelColor : NSColor.controlAccentColor
+            }
             pauseButtonIconLayer.contents = makeSystemSymbolImage(systemSymbolName: symbolName,
                                                                   pointSize: 22,
                                                                   weight: .regular,
@@ -3056,6 +3194,15 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         return String(value)
     }
 
+    private func formatByteCount(_ value: UInt64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useGB, .useMB, .useKB]
+        formatter.countStyle = .file
+        formatter.includesUnit = true
+        formatter.includesCount = true
+        return formatter.string(fromByteCount: Int64(min(value, UInt64(Int64.max))))
+    }
+
     private func formatDuration(_ seconds: Double) -> String {
         if seconds < 1 {
             return "\(Int((seconds * 1000).rounded())) ms"
@@ -3083,8 +3230,10 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                                         label: statusLayer.string as? String ?? "")
         ]
 
-        for (index, event) in currentEvents.enumerated() where index < rowLayers.count && !rowLayers[index].container.isHidden {
-            let frameInRoot = rowsClipLayer.convert(rowLayers[index].container.frame, to: rootLayer)
+        for (index, row) in rowLayers.enumerated() where !row.container.isHidden {
+            guard let renderedRow = eventForRenderedRow(at: index) else { continue }
+            let event = renderedRow.event
+            let frameInRoot = rowsClipLayer.convert(row.container.frame, to: rootLayer)
             children.append(OuterframeAccessibilityNode(identifier: UInt32(1000 + index),
                                                         role: .staticText,
                                                         frame: frameInRoot,

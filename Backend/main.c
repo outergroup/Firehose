@@ -19,6 +19,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -37,8 +38,8 @@
 
 #define READ_BUFFER_SIZE 8192
 #define EVENT_BINARY_MAGIC 0x45435254u
-#define EVENT_BINARY_VERSION 3
-#define EVENT_BINARY_HEADER_SIZE 40
+#define EVENT_BINARY_VERSION 4
+#define EVENT_BINARY_HEADER_SIZE 72
 #define EVENT_BINARY_RECORD_SIZE 64
 #define EVENT_BINARY_MAX_COUNT 512
 #define PROCESS_TIMELINE_BINARY_MAGIC 0x50435254u
@@ -54,12 +55,18 @@
 #define CLEAR_LOG_BINARY_MAGIC 0x434c5254u
 #define CLEAR_LOG_BINARY_VERSION 1
 #define CLEAR_LOG_BINARY_HEADER_SIZE 16
+#define CAPTURE_STATUS_BINARY_MAGIC 0x43535254u
+#define CAPTURE_STATUS_BINARY_VERSION 1
+#define CAPTURE_STATUS_BINARY_HEADER_SIZE 48
 #define PROCESS_NAME_LEN 128
 #define EVENT_PATH_LEN 512
 #define EVENT_FILTER_MAX_CLAUSES 16
 #define EVENT_FILTER_VALUE_LEN 256
 #define DEFAULT_PORT 7352
 #define SAMPLE_INTERVAL_MS 50
+#define STORAGE_CHECK_INTERVAL_SECONDS 1.0
+#define STORAGE_LOW_MIN_FREE_BYTES (1024ull * 1024ull * 1024ull)
+#define STORAGE_LOW_MAX_FREE_BYTES (20ull * 1024ull * 1024ull * 1024ull)
 
 #if defined(__GNUC__) || defined(__clang__)
 #define TRACE_UNUSED __attribute__((unused))
@@ -156,6 +163,8 @@ typedef struct {
     size_t count;
     uint64_t next_id;
     int fd;
+    bool reported_recursive_write_ignore;
+    char path[PATH_MAX];
 } EventStore;
 
 typedef enum {
@@ -164,13 +173,30 @@ typedef enum {
     CAPTURE_MODE_EBPF
 } CaptureMode;
 
+typedef enum {
+    CAPTURE_PAUSE_REASON_NONE = 0,
+    CAPTURE_PAUSE_REASON_USER = 1,
+    CAPTURE_PAUSE_REASON_LOW_STORAGE = 2
+} CapturePauseReason;
+
+typedef struct {
+    bool valid;
+    bool low;
+    uint64_t available_bytes;
+    uint64_t total_bytes;
+    uint64_t threshold_bytes;
+} StorageStatus;
+
 static EventStore g_events = {0};
 static ProcessSnapshot g_previous_snapshot = {0};
 static bool g_has_previous_snapshot = false;
 static FdPathTable g_fd_paths = {0};
 static ProcessParentTable g_process_parents = {0};
 static bool g_capture_paused = false;
+static CapturePauseReason g_capture_pause_reason = CAPTURE_PAUSE_REASON_NONE;
 static bool g_capture_uses_ebpf = false;
+static StorageStatus g_storage_status = {0};
+static double g_last_storage_check_time = 0;
 
 static void add_event(const char *type, const ProcessInfo *process, const char *path, const char *detail);
 static void set_capture_paused(bool paused);
@@ -1082,10 +1108,26 @@ static void consume_perf_ring(PerfRing *ring) {
                     process.ppid = process_parent_lookup(process.pid);
                     int fd = (int)bpf_event.arg0;
                     resolve_fd_path(process.pid, fd, event_path, sizeof(event_path));
-                    snprintf(detail, sizeof(detail), "fd=%llu count=%llu",
-                             (unsigned long long)bpf_event.arg0,
-                             (unsigned long long)bpf_event.arg1);
-                    add_event("file.write", &process, event_path, detail);
+                    if (process.pid == getpid() && fd == g_events.fd) {
+                        if (event_path[0] == '\0') {
+                            snprintf(event_path, sizeof(event_path), "%.*s",
+                                     (int)sizeof(event_path) - 1,
+                                     g_events.path);
+                        }
+                        if (!g_events.reported_recursive_write_ignore) {
+                            g_events.reported_recursive_write_ignore = true;
+                            snprintf(detail, sizeof(detail),
+                                     "fd=%llu count=%llu; Ignoring subsequent writes, to avoid recursive explosion",
+                                     (unsigned long long)bpf_event.arg0,
+                                     (unsigned long long)bpf_event.arg1);
+                            add_event("file.write", &process, event_path, detail);
+                        }
+                    } else {
+                        snprintf(detail, sizeof(detail), "fd=%llu count=%llu",
+                                 (unsigned long long)bpf_event.arg0,
+                                 (unsigned long long)bpf_event.arg1);
+                        add_event("file.write", &process, event_path, detail);
+                    }
                 }
             }
         } else if (header.type == PERF_RECORD_LOST) {
@@ -1335,6 +1377,7 @@ static bool event_store_init(EventStore *store) {
     if (fd < 0) {
         return false;
     }
+    snprintf(store->path, sizeof(store->path), "%s", path);
     unlink(path);
     store->fd = fd;
     return true;
@@ -1346,6 +1389,49 @@ static void event_store_close(EventStore *store) {
     }
     memset(store, 0, sizeof(*store));
     store->fd = -1;
+}
+
+static uint64_t saturating_mul_u64(uint64_t lhs, uint64_t rhs) {
+    if (lhs != 0 && rhs > UINT64_MAX / lhs) {
+        return UINT64_MAX;
+    }
+    return lhs * rhs;
+}
+
+static uint64_t storage_low_threshold_bytes(uint64_t total_bytes) {
+    uint64_t threshold = total_bytes / 100;
+    if (threshold < STORAGE_LOW_MIN_FREE_BYTES) {
+        threshold = STORAGE_LOW_MIN_FREE_BYTES;
+    }
+    if (threshold > STORAGE_LOW_MAX_FREE_BYTES) {
+        threshold = STORAGE_LOW_MAX_FREE_BYTES;
+    }
+    return threshold;
+}
+
+static bool refresh_storage_status(void) {
+    if (g_events.fd < 0) {
+        g_storage_status.valid = false;
+        return false;
+    }
+
+    struct statvfs stats;
+    if (fstatvfs(g_events.fd, &stats) != 0) {
+        g_storage_status.valid = false;
+        return false;
+    }
+
+    uint64_t block_size = stats.f_frsize ? (uint64_t)stats.f_frsize : (uint64_t)stats.f_bsize;
+    uint64_t total_bytes = saturating_mul_u64((uint64_t)stats.f_blocks, block_size);
+    uint64_t available_bytes = saturating_mul_u64((uint64_t)stats.f_bavail, block_size);
+    uint64_t threshold_bytes = storage_low_threshold_bytes(total_bytes);
+
+    g_storage_status.valid = true;
+    g_storage_status.available_bytes = available_bytes;
+    g_storage_status.total_bytes = total_bytes;
+    g_storage_status.threshold_bytes = threshold_bytes;
+    g_storage_status.low = available_bytes <= threshold_bytes;
+    return true;
 }
 
 static bool event_store_clear(EventStore *store) {
@@ -1360,6 +1446,7 @@ static bool event_store_clear(EventStore *store) {
     }
     store->count = 0;
     store->next_id = 0;
+    store->reported_recursive_write_ignore = false;
     return true;
 }
 
@@ -1440,7 +1527,16 @@ static void add_event(const char *type, const ProcessInfo *process, const char *
     if (write_all_fd(g_events.fd, &event, sizeof(event))) {
         g_events.count++;
     } else {
+        int saved_errno = errno;
         fprintf(stderr, "TraceBackend failed to append event: %s\n", strerror(errno));
+        if (saved_errno == ENOSPC) {
+            g_capture_paused = true;
+            g_capture_pause_reason = CAPTURE_PAUSE_REASON_LOW_STORAGE;
+            if (g_capture_uses_ebpf) {
+                set_ebpf_capture_enabled(&g_ebpf_capture, false);
+            }
+            refresh_storage_status();
+        }
     }
 }
 
@@ -1520,8 +1616,25 @@ static bool refresh_process_baseline(void) {
     return true;
 }
 
-static void set_capture_paused(bool paused) {
-    if (g_capture_paused == paused) {
+static void format_bytes_compact(uint64_t bytes, char *buffer, size_t buffer_size) {
+    const char *units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+    double value = (double)bytes;
+    size_t unit_index = 0;
+    while (value >= 1024.0 && unit_index + 1 < sizeof(units) / sizeof(units[0])) {
+        value /= 1024.0;
+        unit_index++;
+    }
+    if (unit_index == 0) {
+        snprintf(buffer, buffer_size, "%" PRIu64 " %s", bytes, units[unit_index]);
+    } else {
+        snprintf(buffer, buffer_size, "%.1f %s", value, units[unit_index]);
+    }
+}
+
+static void set_capture_paused_internal(bool paused,
+                                        CapturePauseReason reason,
+                                        const char *detail) {
+    if (g_capture_paused == paused && g_capture_pause_reason == reason) {
         return;
     }
 
@@ -1529,11 +1642,12 @@ static void set_capture_paused(bool paused) {
     snprintf(self.name, sizeof(self.name), "trace");
 
     if (paused) {
-        add_event("capture.pause", &self, "", "Paused event capture");
+        add_event("capture.pause", &self, "", detail ? detail : "Paused event capture");
         if (g_capture_uses_ebpf) {
             set_ebpf_capture_enabled(&g_ebpf_capture, false);
         }
         g_capture_paused = true;
+        g_capture_pause_reason = reason;
         return;
     }
 
@@ -1544,7 +1658,50 @@ static void set_capture_paused(bool paused) {
         refresh_process_baseline();
     }
     g_capture_paused = false;
+    g_capture_pause_reason = CAPTURE_PAUSE_REASON_NONE;
     add_event("capture.resume", &self, "", "Resumed event capture");
+}
+
+static void pause_capture_for_low_storage(void) {
+    char available[64];
+    char threshold[64];
+    format_bytes_compact(g_storage_status.available_bytes, available, sizeof(available));
+    format_bytes_compact(g_storage_status.threshold_bytes, threshold, sizeof(threshold));
+    char detail[256];
+    snprintf(detail, sizeof(detail),
+             "Paused event capture because available storage is low: %s available, threshold %s",
+             available, threshold);
+    set_capture_paused_internal(true, CAPTURE_PAUSE_REASON_LOW_STORAGE, detail);
+}
+
+static void update_storage_pause_state(bool force) {
+    double now = current_time_seconds();
+    if (!force && now - g_last_storage_check_time < STORAGE_CHECK_INTERVAL_SECONDS) {
+        return;
+    }
+    g_last_storage_check_time = now;
+
+    if (!refresh_storage_status()) {
+        return;
+    }
+    if (g_storage_status.low) {
+        pause_capture_for_low_storage();
+    }
+}
+
+static void set_capture_paused(bool paused) {
+    if (paused) {
+        set_capture_paused_internal(true, CAPTURE_PAUSE_REASON_USER, "Paused event capture");
+        return;
+    }
+
+    update_storage_pause_state(true);
+    if (g_storage_status.valid && g_storage_status.low) {
+        pause_capture_for_low_storage();
+        return;
+    }
+
+    set_capture_paused_internal(false, CAPTURE_PAUSE_REASON_NONE, NULL);
 }
 
 static bool clear_capture_log(void) {
@@ -2178,6 +2335,21 @@ static size_t build_events_binary(size_t start, size_t count, bool tail, const E
     write_uint32_le(buffer + 24, (uint32_t)event_count);
     write_uint32_le(buffer + 28, EVENT_BINARY_RECORD_SIZE);
     write_uint64_le(buffer + 32, (uint64_t)g_events.count);
+    uint32_t capture_flags = 0;
+    if (g_capture_paused) {
+        capture_flags |= 1u << 0;
+    }
+    if (g_storage_status.valid) {
+        capture_flags |= 1u << 1;
+    }
+    if (g_storage_status.valid && g_storage_status.low) {
+        capture_flags |= 1u << 2;
+    }
+    write_uint32_le(buffer + 40, capture_flags);
+    write_uint32_le(buffer + 44, (uint32_t)g_capture_pause_reason);
+    write_uint64_le(buffer + 48, g_storage_status.available_bytes);
+    write_uint64_le(buffer + 56, g_storage_status.threshold_bytes);
+    write_uint64_le(buffer + 64, g_storage_status.total_bytes);
 
     size_t variable_offset = fixed_size;
     for (size_t i = 0; i < event_count; ++i) {
@@ -2520,6 +2692,7 @@ static void send_events_response(int fd, const char *query) {
     parse_size_query_value(query, "start", &start);
     parse_size_query_value(query, "count", &count);
     bool tail = parse_bool_query_value(query, "tail");
+    update_storage_pause_state(false);
 
     unsigned char *payload = NULL;
     size_t len = build_events_binary(start, count, tail, &filter, &payload);
@@ -2695,6 +2868,37 @@ static void send_clear_log_response(int fd) {
     free(payload);
 }
 
+static size_t build_capture_status_binary(unsigned char **buffer_out) {
+    unsigned char *buffer = calloc(1, CAPTURE_STATUS_BINARY_HEADER_SIZE);
+    if (!buffer) {
+        return 0;
+    }
+
+    uint32_t capture_flags = 0;
+    if (g_capture_paused) {
+        capture_flags |= 1u << 0;
+    }
+    if (g_storage_status.valid) {
+        capture_flags |= 1u << 1;
+    }
+    if (g_storage_status.valid && g_storage_status.low) {
+        capture_flags |= 1u << 2;
+    }
+
+    write_uint32_le(buffer + 0, CAPTURE_STATUS_BINARY_MAGIC);
+    write_uint16_le(buffer + 4, CAPTURE_STATUS_BINARY_VERSION);
+    write_uint16_le(buffer + 6, CAPTURE_STATUS_BINARY_HEADER_SIZE);
+    write_uint32_le(buffer + 8, capture_flags);
+    write_uint32_le(buffer + 12, (uint32_t)g_capture_pause_reason);
+    write_uint64_le(buffer + 16, g_storage_status.available_bytes);
+    write_uint64_le(buffer + 24, g_storage_status.threshold_bytes);
+    write_uint64_le(buffer + 32, g_storage_status.total_bytes);
+    write_uint64_le(buffer + 40, 0);
+
+    *buffer_out = buffer;
+    return CAPTURE_STATUS_BINARY_HEADER_SIZE;
+}
+
 static void send_capture_response(int fd, const char *query) {
     char value[16];
     if (parse_string_query_value(query, "paused", value, sizeof(value))) {
@@ -2703,10 +2907,16 @@ static void send_capture_response(int fd, const char *query) {
                       strcasecmp(value, "yes") == 0;
         set_capture_paused(paused);
     }
+    update_storage_pause_state(true);
 
-    char body[64];
-    snprintf(body, sizeof(body), "paused=%d\n", g_capture_paused ? 1 : 0);
-    send_response(fd, 200, "OK", "text/plain; charset=utf-8", body, strlen(body));
+    unsigned char *payload = NULL;
+    size_t len = build_capture_status_binary(&payload);
+    if (len == 0) {
+        send_text_response(fd, 500, "failed to build capture status response\n");
+        return;
+    }
+    send_response(fd, 200, "OK", "application/vnd.trace.capture", payload, len);
+    free(payload);
 }
 
 static void handle_client(int fd) {
@@ -2924,6 +3134,7 @@ int main(int argc, char **argv) {
             perror("poll");
             break;
         }
+        update_storage_pause_state(false);
         if (g_capture_paused) {
             continue;
         }
