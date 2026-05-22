@@ -2104,11 +2104,12 @@ static int compare_process_timeline_items(const void *lhs, const void *rhs) {
 static bool build_process_timeline(ProcessTimeline *timeline,
                                    double *capture_start_out,
                                    double *capture_end_out,
-                                   uint64_t *event_count_out) {
+                                   uint64_t *event_count_out,
+                                   const EventFilter *filter) {
     memset(timeline, 0, sizeof(*timeline));
     *capture_start_out = 0;
     *capture_end_out = 0;
-    *event_count_out = (uint64_t)g_events.count;
+    *event_count_out = 0;
 
     bool has_any_event = g_events.count > 0;
     if (has_any_event) {
@@ -2138,6 +2139,7 @@ static bool build_process_timeline(ProcessTimeline *timeline,
         if (event.pid <= 0) {
             continue;
         }
+        bool matches_filter = event_matches_filter(&event, filter);
         if (strcmp(event.type, "process.fork") == 0 && event.ppid > 0) {
             if (!ensure_process_timeline_parent_item(timeline, &event)) {
                 free_process_timeline(timeline);
@@ -2154,7 +2156,7 @@ static bool build_process_timeline(ProcessTimeline *timeline,
             }
         }
 
-        if (has_any_event) {
+        if (matches_filter && has_any_event) {
             double duration = *capture_end_out - *capture_start_out;
             size_t bucket = 0;
             if (duration > 0 && PROCESS_TIMELINE_DOT_BUCKET_COUNT > 1) {
@@ -2175,7 +2177,10 @@ static bool build_process_timeline(ProcessTimeline *timeline,
             }
         }
 
-        item->event_count++;
+        if (matches_filter) {
+            item->event_count++;
+            (*event_count_out)++;
+        }
         if (event.timestamp < item->first_timestamp) {
             item->first_timestamp = event.timestamp;
         }
@@ -2229,16 +2234,24 @@ static bool build_process_timeline(ProcessTimeline *timeline,
         }
     }
 
+    size_t out = 0;
+    for (size_t i = 0; i < timeline->count; ++i) {
+        if (timeline->items[i].event_count > 0) {
+            timeline->items[out++] = timeline->items[i];
+        }
+    }
+    timeline->count = out;
+
     qsort(timeline->items, timeline->count, sizeof(ProcessTimelineItem), compare_process_timeline_items);
     return true;
 }
 
-static size_t build_process_timeline_binary(unsigned char **buffer_out) {
+static size_t build_process_timeline_binary(const EventFilter *filter, unsigned char **buffer_out) {
     ProcessTimeline timeline = {0};
     double capture_start = 0;
     double capture_end = 0;
     uint64_t event_count = 0;
-    if (!build_process_timeline(&timeline, &capture_start, &capture_end, &event_count)) {
+    if (!build_process_timeline(&timeline, &capture_start, &capture_end, &event_count, filter)) {
         return 0;
     }
 
@@ -2934,9 +2947,10 @@ static void send_event_position_response(int fd, const char *query) {
     free(payload);
 }
 
-static void send_process_timeline_response(int fd) {
+static void send_process_timeline_response(int fd, const char *query) {
+    EventFilter filter = parse_event_filter_query(query);
     unsigned char *payload = NULL;
-    size_t len = build_process_timeline_binary(&payload);
+    size_t len = build_process_timeline_binary(&filter, &payload);
     if (len == 0) {
         send_text_response(fd, 500, "failed to build process timeline response\n");
         return;
@@ -3074,7 +3088,7 @@ static void handle_client(int fd) {
     } else if (strcmp(target, "/api/event-position") == 0) {
         send_event_position_response(fd, query);
     } else if (strcmp(target, "/api/processes") == 0) {
-        send_process_timeline_response(fd);
+        send_process_timeline_response(fd, query);
     } else if (strcmp(target, "/api/clear") == 0) {
         send_clear_log_response(fd);
     } else if (strcmp(target, "/api/capture") == 0) {

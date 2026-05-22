@@ -592,6 +592,8 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     private var activeFilterIndex = 0
     private var isSyncingFilterInput = false
     private var filterClauses: [FilterClause] = []
+    private var pendingFilterContextMenuID: UUID?
+    private var pendingCellContextMenuID: UUID?
     private var pendingCellFilterContext: CellFilterContext?
     private var selectedTableCell: TableCellSelection?
     private var isCapturePaused = false
@@ -600,6 +602,8 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     private var processTimelineInFlight = false
     private var pendingProcessTimelineFetchAfterInFlight = false
     private var lastProcessTimelineRequestedEventCount: UInt64 = 0
+    private var lastProcessTimelineRequestedFilterKey = ""
+    private var inFlightProcessTimelineFilterKey = ""
     private var processTimelineResponse: ProcessTimelineResponse?
     private var processTimelineRows: [TimelineProcessRow] = []
     private var processTimelineDotsByPID: [Int: [TimelineEventDot]] = [:]
@@ -767,12 +771,15 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                 setFilterPanelExpanded(false)
             }
 
-        case .copySelectedPasteboardRequest(let requestID):
+        case .selectionToPasteboardCopyRequest(let requestID):
             outerframeHost.sendCopySelectedPasteboardResponse(requestID: requestID,
                                                               items: pasteboardItemsForCopy())
 
-        case .pasteboardContentDelivered(let items):
+        case .pasteboardContentPasted(let items):
             handlePasteboardItemsForPaste(items)
+
+        case .pasteboardAccessResponse:
+            break
 
         case .accessibilitySnapshotRequest(let requestID):
             outerframeHost.sendAccessibilitySnapshotResponse(requestID: requestID,
@@ -1734,32 +1741,38 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         selectedTableCell = TableCellSelection(columnTitle: tableHit.columnTitle, value: tableHit.value)
         updateTextInputState()
 
-        guard let filterHit = cellFilterHit(at: point),
-              !filterHit.value.isEmpty else {
-            outerframeHost.showContextMenu(for: NSAttributedString(string: tableHit.value), at: point)
-            return
+        let menuID = UUID()
+        pendingCellContextMenuID = menuID
+        let filterHit = cellFilterHit(at: point)
+        if let filterHit, !filterHit.value.isEmpty {
+            pendingCellFilterContext = CellFilterContext(menuID: menuID,
+                                                         column: filterHit.column,
+                                                         value: filterHit.value)
+        } else {
+            pendingCellFilterContext = nil
         }
 
-        let menuID = UUID()
-        pendingCellFilterContext = CellFilterContext(menuID: menuID,
-                                                     column: filterHit.column,
-                                                     value: filterHit.value)
-        let value = displayValue(filterHit.value, maxLength: 80)
+        var menuItems: [OuterframeContextMenuItem] = []
+        if let filterHit, !filterHit.value.isEmpty {
+            let value = displayValue(filterHit.value, maxLength: 80)
+            menuItems.append(OuterframeContextMenuItem(id: "include",
+                                                       title: "Include \(filterHit.column.title) is \"\(value)\""))
+            menuItems.append(OuterframeContextMenuItem(id: "exclude",
+                                                       title: "Exclude \(filterHit.column.title) is \"\(value)\""))
+            menuItems.append(OuterframeContextMenuItem(id: "copy-separator",
+                                                       title: "",
+                                                       isEnabled: false,
+                                                       isSeparator: true))
+        }
+        menuItems.append(OuterframeContextMenuItem(id: "copy",
+                                                   title: "Copy",
+                                                   action: .standardCopy))
+        menuItems.append(OuterframeContextMenuItem(id: "copy-programmatic",
+                                                   title: "Copy (programmatic)"))
+
         outerframeHost.showContextMenu(
             menuID: menuID,
-            items: [
-                OuterframeContextMenuItem(id: "include",
-                                          title: "Include \(filterHit.column.title) is \"\(value)\""),
-                OuterframeContextMenuItem(id: "exclude",
-                                          title: "Exclude \(filterHit.column.title) is \"\(value)\""),
-                OuterframeContextMenuItem(id: "copy-separator",
-                                          title: "",
-                                          isEnabled: false,
-                                          isSeparator: true),
-                OuterframeContextMenuItem(id: "copy",
-                                          title: "Copy",
-                                          action: .standardCopy)
-            ],
+            items: menuItems,
             at: point
         )
     }
@@ -1791,7 +1804,54 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             updateFilterText()
             updateTextInputState()
             let selectedText = filterInputController.selectedTextContent() ?? ""
-            outerframeHost.showContextMenu(for: NSAttributedString(string: selectedText), at: point)
+            var menuItems: [OuterframeContextMenuItem] = []
+            if !selectedText.isEmpty {
+                menuItems.append(OuterframeContextMenuItem(id: "lookup",
+                                                           title: "Look Up \"\(displayValue(selectedText, maxLength: 80))\"",
+                                                           action: .standardLookUp))
+                menuItems.append(OuterframeContextMenuItem(id: "lookup-separator",
+                                                           title: "",
+                                                           isEnabled: false,
+                                                           isSeparator: true))
+            }
+            menuItems.append(OuterframeContextMenuItem(id: "cut",
+                                                       title: "Cut",
+                                                       action: .standardCut,
+                                                       isEnabled: filterInputController.hasSelection))
+            menuItems.append(OuterframeContextMenuItem(id: "copy",
+                                                       title: "Copy",
+                                                       action: .standardCopy,
+                                                       isEnabled: filterInputController.hasSelection))
+            menuItems.append(OuterframeContextMenuItem(id: "paste",
+                                                       title: "Paste",
+                                                       action: .standardPaste))
+            menuItems.append(OuterframeContextMenuItem(id: "select-all",
+                                                       title: "Select All",
+                                                       action: .standardSelectAll,
+                                                       isEnabled: !filterInputController.text.isEmpty))
+            if !selectedText.isEmpty {
+                menuItems.append(OuterframeContextMenuItem(id: "services-separator",
+                                                           title: "",
+                                                           isEnabled: false,
+                                                           isSeparator: true))
+                menuItems.append(OuterframeContextMenuItem(id: "services",
+                                                           title: "Services",
+                                                           action: .standardServices))
+            }
+            menuItems.append(OuterframeContextMenuItem(id: "paste-programmatic-separator",
+                                                       title: "",
+                                                       isEnabled: false,
+                                                       isSeparator: true))
+            menuItems.append(OuterframeContextMenuItem(id: "paste-programmatic",
+                                                       title: "Paste (programmatic)"))
+            let menuID = UUID()
+            pendingFilterContextMenuID = menuID
+            outerframeHost.showContextMenu(
+                menuID: menuID,
+                items: menuItems,
+                at: point,
+                attributedText: selectedText.isEmpty ? nil : NSAttributedString(string: selectedText)
+            )
             return true
         }
 
@@ -1799,21 +1859,45 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     }
 
     private func handleContextMenuSelection(menuID: UUID, itemID: String) {
-        guard let context = pendingCellFilterContext,
-              context.menuID == menuID else {
+        if pendingFilterContextMenuID == menuID {
+            pendingFilterContextMenuID = nil
+            switch itemID {
+            case "paste-programmatic":
+                outerframeHost.requestPasteboardRead(
+                    typeIdentifiers: [
+                        NSPasteboard.PasteboardType.string.rawValue,
+                        NSPasteboard.PasteboardType.rtf.rawValue
+                    ]
+                ) { [weak self] granted, items in
+                    guard granted else { return }
+                    self?.handlePasteboardItemsForPaste(items)
+                }
+            default:
+                break
+            }
             return
         }
+
+        guard pendingCellContextMenuID == menuID else {
+            return
+        }
+        let context = pendingCellFilterContext
+        pendingCellContextMenuID = nil
         pendingCellFilterContext = nil
 
         switch itemID {
         case "include":
+            guard let context else { return }
             addFilterClause(FilterClause(column: context.column,
                                          operation: .equals,
                                          value: context.value))
         case "exclude":
+            guard let context else { return }
             addFilterClause(FilterClause(column: context.column,
                                          operation: .notEquals,
                                          value: context.value))
+        case "copy-programmatic":
+            outerframeHost.requestPasteboardWrite(items: pasteboardItemsForCopy())
         default:
             break
         }
@@ -2054,10 +2138,12 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         lastRequestedCount = -1
         lastRequestedTail = false
         lastRequestedFilterKey = ""
+        lastProcessTimelineRequestedFilterKey = ""
         updateFilterText()
         updateLayout()
         updateTextInputState()
         fetchVisibleWindow(force: true)
+        fetchProcessTimeline(force: true)
     }
 
     private func applyCaptureStatus(_ status: CaptureStatus) {
@@ -2184,6 +2270,8 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         processTimelineInFlight = false
         pendingProcessTimelineFetchAfterInFlight = false
         lastProcessTimelineRequestedEventCount = 0
+        lastProcessTimelineRequestedFilterKey = ""
+        inFlightProcessTimelineFilterKey = ""
         hoveredProcessTimelineDot = nil
         processTimelineHoveredDotLayer.path = nil
         processTimelineScrollOffset = 0
@@ -2356,18 +2444,17 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
 
     private func updateEditingCapabilities() {
         if filterInputController.isFocused {
-            outerframeHost.setPasteboardCapabilities(filterInputController.currentEditingCapabilities())
+            let capabilities = filterInputController.currentEditingCapabilities()
+            let acceptedTypes = filterInputController.currentAcceptedPasteboardTypeIdentifiers()
+            outerframeHost.setEditingCapabilities(canCopy: capabilities.canCopy,
+                                                  canCut: capabilities.canCut)
+            outerframeHost.setAcceptedPasteboardPasteTypes(acceptedTypes)
             return
         }
 
         let canCopyCell = selectedTableCell?.value.isEmpty == false
-        outerframeHost.setPasteboardCapabilities(
-            OuterframeContentEditingCapabilities(
-                canCopy: canCopyCell,
-                canCut: false,
-                acceptablePasteboardTypeIdentifiers: []
-            )
-        )
+        outerframeHost.setEditingCapabilities(canCopy: canCopyCell, canCut: false)
+        outerframeHost.setAcceptedPasteboardPasteTypes([])
     }
 
     private func pasteboardItemsForCopy() -> [OuterframeContentPasteboardItem] {
@@ -2389,25 +2476,29 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         guard filterInputController.isFocused else { return }
 
         for item in items {
-            if item.typeIdentifier == NSPasteboard.PasteboardType.string.rawValue,
-               let stringValue = String(data: item.data, encoding: .utf8) {
-                filterInputController.insertText(stringValue)
-                return
-            }
+            for representation in item.representations {
+                if representation.typeIdentifier == NSPasteboard.PasteboardType.string.rawValue,
+                   let stringValue = String(data: representation.data, encoding: .utf8) {
+                    filterInputController.insertText(stringValue)
+                    return
+                }
 
-            if item.typeIdentifier == NSPasteboard.PasteboardType.rtf.rawValue,
-               let attributed = try? NSAttributedString(data: item.data,
-                                                        options: [.documentType: NSAttributedString.DocumentType.rtf],
-                                                        documentAttributes: nil) {
-                filterInputController.insertText(attributed.string)
-                return
+                if representation.typeIdentifier == NSPasteboard.PasteboardType.rtf.rawValue,
+                   let attributed = try? NSAttributedString(data: representation.data,
+                                                            options: [.documentType: NSAttributedString.DocumentType.rtf],
+                                                            documentAttributes: nil) {
+                    filterInputController.insertText(attributed.string)
+                    return
+                }
             }
         }
     }
 
     private func stringPasteboardItems(for value: String) -> [OuterframeContentPasteboardItem] {
-        [OuterframeContentPasteboardItem(typeIdentifier: NSPasteboard.PasteboardType.string.rawValue,
-                                         data: Data(value.utf8))]
+        [OuterframeContentPasteboardItem(representations: [
+            OuterframeContentPasteboardRepresentation(typeIdentifier: NSPasteboard.PasteboardType.string.rawValue,
+                                                      data: Data(value.utf8))
+        ])]
     }
 
     private func activeFilterValue() -> String {
@@ -2775,16 +2866,19 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         guard let processTimelineEndpoint,
               let urlSession else { return }
         if processTimelineInFlight {
-            if !force {
-                pendingProcessTimelineFetchAfterInFlight = true
-            }
+            pendingProcessTimelineFetchAfterInFlight = true
             return
         }
 
+        var components = URLComponents(url: processTimelineEndpoint, resolvingAgainstBaseURL: false)
+        components?.queryItems = activeFilterQueryItems()
+        guard let url = components?.url else { return }
+        let filterKey = currentFilterKey()
         pendingProcessTimelineFetchAfterInFlight = false
         processTimelineInFlight = true
+        inFlightProcessTimelineFilterKey = filterKey
         let requestGeneration = logGeneration
-        urlSession.dataTask(with: processTimelineEndpoint) { [weak self] data, _, error in
+        urlSession.dataTask(with: url) { [weak self] data, _, error in
             let errorText = error?.localizedDescription
             Task { @MainActor in
                 self?.handleProcessTimelineFetchResult(data: data,
@@ -2795,16 +2889,25 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     }
 
     private func requestProcessTimelineRefreshIfNeeded(eventCount: UInt64) {
-        guard eventCount != lastProcessTimelineRequestedEventCount else { return }
+        let filterKey = currentFilterKey()
+        guard eventCount != lastProcessTimelineRequestedEventCount ||
+              filterKey != lastProcessTimelineRequestedFilterKey else { return }
         lastProcessTimelineRequestedEventCount = eventCount
+        lastProcessTimelineRequestedFilterKey = filterKey
         fetchProcessTimeline(force: false)
     }
 
     private func handleProcessTimelineFetchResult(data: Data?, errorText: String?, generation: Int) {
         guard generation == logGeneration else { return }
         processTimelineInFlight = false
+        let responseFilterKey = inFlightProcessTimelineFilterKey
+        inFlightProcessTimelineFilterKey = ""
         let hadPendingFetch = pendingProcessTimelineFetchAfterInFlight
         pendingProcessTimelineFetchAfterInFlight = false
+        if responseFilterKey != currentFilterKey() {
+            fetchProcessTimeline(force: true)
+            return
+        }
         if let errorText {
             lastErrorText = errorText
             updateStatusText()

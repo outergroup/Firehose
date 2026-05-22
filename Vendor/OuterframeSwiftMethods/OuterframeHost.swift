@@ -9,6 +9,7 @@ import AppKit
 import Foundation
 import Network
 import QuartzCore
+import UniformTypeIdentifiers
 
 enum OuterframeHostError: LocalizedError {
     case apiFailure(String)
@@ -23,6 +24,120 @@ enum OuterframeHostError: LocalizedError {
 
 typealias OuterframeHostMessageHandler = @MainActor (OuterframeHost, BrowserToContentMessage) -> Void
 typealias OuterframeHostDisconnectHandler = @MainActor (OuterframeHost) -> Void
+
+private enum OuterframeHostPasteboardPayload {
+    static let filePromiseTypeIdentifier = "org.outerframe.file-promise"
+
+    private static let version: UInt32 = 1
+    private static let missingSize = UInt64.max
+
+    static func encodeFilePromise(id: UUID,
+                                  name: String,
+                                  fileSize: UInt64?,
+                                  fileType: String?) -> Data? {
+        var builder = BinaryPayloadBuilder(referenceBaseOffset: 0)
+        builder.append(uint32: version)
+        builder.append(uint32: 0)
+        builder.append(uuid: id)
+        builder.append(uint64: fileSize ?? missingSize)
+        guard builder.append(stringReference: name),
+              builder.append(stringReference: fileType ?? "") else {
+            return nil
+        }
+        return builder.finalize()
+    }
+}
+
+private struct BinaryPayloadBuilder {
+    private struct Reference {
+        let patchOffset: Int
+        let variableOffset: Int
+        let length: Int
+    }
+
+    private var fixed = Data()
+    private var variable = Data()
+    private var references: [Reference] = []
+    private let referenceBaseOffset: Int
+
+    init(referenceBaseOffset: Int) {
+        self.referenceBaseOffset = referenceBaseOffset
+    }
+
+    mutating func append(uint32 value: UInt32) {
+        fixed.appendLittleEndian(value)
+    }
+
+    mutating func append(uint64 value: UInt64) {
+        fixed.appendLittleEndian(value)
+    }
+
+    mutating func append(uuid value: UUID) {
+        fixed.append(uuid: value)
+    }
+
+    mutating func append(stringReference string: String) -> Bool {
+        guard let data = string.data(using: .utf8),
+              data.count <= Int(UInt32.max) else {
+            return false
+        }
+        let patchOffset = fixed.count
+        fixed.appendLittleEndian(UInt32(0))
+        fixed.appendLittleEndian(UInt32(data.count))
+        references.append(Reference(patchOffset: patchOffset,
+                                    variableOffset: variable.count,
+                                    length: data.count))
+        variable.append(data)
+        return true
+    }
+
+    mutating func finalize() -> Data? {
+        guard fixed.count <= Int(UInt32.max),
+              variable.count <= Int(UInt32.max),
+              variable.count <= Int(UInt32.max) - fixed.count else {
+            return nil
+        }
+
+        for reference in references {
+            let offset = referenceBaseOffset + fixed.count + reference.variableOffset
+            guard offset <= Int(UInt32.max),
+                  reference.length <= Int(UInt32.max) else {
+                return nil
+            }
+            fixed.replaceLittleEndianUInt32(at: reference.patchOffset, with: UInt32(offset))
+            fixed.replaceLittleEndianUInt32(at: reference.patchOffset + 4, with: UInt32(reference.length))
+        }
+
+        var payload = Data(capacity: fixed.count + variable.count)
+        payload.append(fixed)
+        payload.append(variable)
+        return payload
+    }
+}
+
+private extension Data {
+    mutating func appendLittleEndian(_ value: UInt32) {
+        var value = value.littleEndian
+        Swift.withUnsafeBytes(of: &value) { append(contentsOf: $0) }
+    }
+
+    mutating func appendLittleEndian(_ value: UInt64) {
+        var value = value.littleEndian
+        Swift.withUnsafeBytes(of: &value) { append(contentsOf: $0) }
+    }
+
+    mutating func append(uuid value: UUID) {
+        var uuidValue = value.uuid
+        Swift.withUnsafeBytes(of: &uuidValue) { append(contentsOf: $0) }
+    }
+
+    mutating func replaceLittleEndianUInt32(at offset: Int, with value: UInt32) {
+        var value = value.littleEndian
+        Swift.withUnsafeBytes(of: &value) {
+            replaceSubrange(offset..<(offset + 4), with: $0)
+        }
+    }
+}
 
 /// Delegate for receiving decoded messages from the browser.
 @MainActor
@@ -40,6 +155,13 @@ protocol OuterframeHostDelegate: AnyObject {
 @MainActor
 final class OuterframeHost: SocketToBrowserDelegate {
     let socket: SocketToBrowser
+    var stagedFileDirectoryURL: URL? {
+        guard let path = ProcessInfo.processInfo.environment["OUTERFRAME_STAGING_DIR"],
+              !path.isEmpty else {
+            return nil
+        }
+        return URL(fileURLWithPath: path, isDirectory: true)
+    }
 
     /// Delegate for receiving decoded messages from the browser.
     weak var delegate: OuterframeHostDelegate?
@@ -62,6 +184,7 @@ final class OuterframeHost: SocketToBrowserDelegate {
     private var pendingDisplayLinkCallbacks: [UUID: @MainActor @Sendable (CFTimeInterval) -> Void] = [:]
     private var callbackIDToBrowserID: [UUID: UUID] = [:]
     private var browserIDToCallbackID: [UUID: UUID] = [:]
+    private var pendingPasteboardAccessRequests: [UUID: @MainActor (Bool, [OuterContentPasteboardItem]) -> Void] = [:]
 
     /// Creates an OuterframeHost and starts the socket.
     /// Call `configure()` after receiving the initializeContent message to set context and appearance.
@@ -128,6 +251,13 @@ final class OuterframeHost: SocketToBrowserDelegate {
         case .displayLinkCallbackRegistered(let callbackID, let browserCallbackID):
             handleDisplayLinkCallbackRegistered(callbackID: callbackID, browserCallbackID: browserCallbackID)
             return
+
+        case .pasteboardAccessResponse(let requestID, let granted, let items):
+            if let completion = pendingPasteboardAccessRequests.removeValue(forKey: requestID) {
+                completion(granted, items)
+            }
+            return
+
         case .initializeContent(let arguments):
             _currentHistoryEntryID = arguments.historyEntryID
 
@@ -185,14 +315,42 @@ final class OuterframeHost: SocketToBrowserDelegate {
         }
     }
 
-    // MARK: - Pasteboard Capabilities
+    // MARK: - Pasteboard
 
-    func setPasteboardCapabilities(_ capabilities: OuterframeContentEditingCapabilities) {
+    func setEditingCapabilities(canCopy: Bool, canCut: Bool) {
         Task {
-            try? await socket.send(ContentToBrowserMessage.setPasteboardCapabilities(
-                canCopy: capabilities.canCopy,
-                canCut: capabilities.canCut,
-                pasteboardTypes: capabilities.acceptablePasteboardTypeIdentifiers
+            try? await socket.send(ContentToBrowserMessage.setEditingCapabilities(canCopy: canCopy,
+                                                                                  canCut: canCut).encode())
+        }
+    }
+
+    func setPasteboardDropBehaviorUniform(_ pasteboardTypeIdentifiers: [String]) {
+        Task {
+            try? await socket.send(ContentToBrowserMessage.setPasteboardDropBehaviorUniform(
+                pasteboardTypeIdentifiers
+            ).encode())
+        }
+    }
+
+    func setAcceptedPasteboardPasteTypes(_ pasteboardTypeIdentifiers: [String]) {
+        Task {
+            try? await socket.send(ContentToBrowserMessage.setAcceptedPasteboardPasteTypes(
+                pasteboardTypeIdentifiers
+            ).encode())
+        }
+    }
+
+    func setPasteboardDropBehaviorHitTest() {
+        Task {
+            try? await socket.send(ContentToBrowserMessage.setPasteboardDropBehaviorHitTest.encode())
+        }
+    }
+
+    func sendPasteboardDropHitTestResponse(requestID: UUID, operationMask: NSDragOperation) {
+        Task {
+            try? await socket.send(ContentToBrowserMessage.pasteboardDropHitTestResponse(
+                requestID: requestID,
+                operationMask: UInt32(truncatingIfNeeded: operationMask.rawValue)
             ).encode())
         }
     }
@@ -309,12 +467,20 @@ final class OuterframeHost: SocketToBrowserDelegate {
         }
     }
 
-    func showContextMenu(menuID: UUID, items: [OuterframeContextMenuItem], at location: CGPoint) {
+    func showContextMenu(menuID: UUID,
+                         items: [OuterframeContextMenuItem],
+                         at location: CGPoint,
+                         attributedText: NSAttributedString? = nil) {
+        let attributedTextData = attributedText.flatMap {
+            try? $0.data(from: NSRange(location: 0, length: $0.length),
+                         documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf])
+        }
         Task {
             try? await socket.send(ContentToBrowserMessage.showContextMenuItems(
                 menuID: menuID,
                 locationX: location.x,
                 locationY: location.y,
+                attributedTextData: attributedTextData,
                 items: items
             ).encode())
         }
@@ -363,9 +529,163 @@ final class OuterframeHost: SocketToBrowserDelegate {
     /// Sends a copy selected pasteboard response to the browser.
     func sendCopySelectedPasteboardResponse(requestID: UUID, items: [OuterContentPasteboardItem]) {
         Task {
-            try? await socket.send(ContentToBrowserMessage.copySelectedPasteboardResponse(
+            try? await socket.send(ContentToBrowserMessage.selectionToPasteboardResponse(
                 requestID: requestID,
                 items: items
+            ).encode())
+        }
+    }
+
+    func requestPasteboardWrite(items: [OuterContentPasteboardItem],
+                                completion: (@MainActor (Bool) -> Void)? = nil) {
+        let requestID = UUID()
+        pendingPasteboardAccessRequests[requestID] = { granted, _ in
+            completion?(granted)
+        }
+        Task {
+            do {
+                try await socket.send(ContentToBrowserMessage.pasteboardAccessRequest(
+                    requestID: requestID,
+                    operation: .write,
+                    pasteboardTypes: [],
+                    items: items
+                ).encode())
+            } catch {
+                await MainActor.run {
+                    if let pending = self.pendingPasteboardAccessRequests.removeValue(forKey: requestID) {
+                        pending(false, [])
+                    }
+                }
+            }
+        }
+    }
+
+    func requestPasteboardRead(typeIdentifiers: [String],
+                               completion: @escaping @MainActor (Bool, [OuterContentPasteboardItem]) -> Void) {
+        let requestID = UUID()
+        pendingPasteboardAccessRequests[requestID] = completion
+        Task {
+            do {
+                try await socket.send(ContentToBrowserMessage.pasteboardAccessRequest(
+                    requestID: requestID,
+                    operation: .read,
+                    pasteboardTypes: typeIdentifiers,
+                    items: []
+                ).encode())
+            } catch {
+                await MainActor.run {
+                    if let pending = self.pendingPasteboardAccessRequests.removeValue(forKey: requestID) {
+                        pending(false, [])
+                    }
+                }
+            }
+        }
+    }
+
+    func beginDraggingPasteboardItems(_ items: [OuterContentPasteboardItem],
+                                      operationMask: NSDragOperation = .copy) {
+        let draggingItems = items.map { OuterContentDraggingItem(pasteboardItem: $0) }
+        beginDraggingPasteboardItems(draggingItems, operationMask: operationMask)
+    }
+
+    func beginDraggingPasteboardItem(_ item: OuterContentPasteboardItem,
+                                     operationMask: NSDragOperation = .copy,
+                                     previewPNGData: Data?,
+                                     previewSize: CGSize?) {
+        beginDraggingPasteboardItems(
+            [
+                OuterContentDraggingItem(
+                    pasteboardItem: item,
+                    previewImageData: previewPNGData,
+                    previewSize: previewSize
+                )
+            ],
+            operationMask: operationMask
+        )
+    }
+
+    func beginDraggingPasteboardItems(_ items: [OuterContentDraggingItem],
+                                      operationMask: NSDragOperation = .copy) {
+        Task {
+            try? await socket.send(ContentToBrowserMessage.beginDraggingPasteboardItems(
+                items: items,
+                operationMask: UInt32(truncatingIfNeeded: operationMask.rawValue)
+            ).encode())
+        }
+    }
+
+    func filePromisePasteboardItem(promiseID: UUID,
+                                   name: String,
+                                   fileSize: UInt64? = nil,
+                                   fileType: String? = nil) -> OuterContentPasteboardItem? {
+        guard !name.isEmpty,
+              let payload = OuterframeHostPasteboardPayload.encodeFilePromise(
+                id: promiseID,
+                name: name,
+                fileSize: fileSize,
+                fileType: fileType
+              ) else {
+            return nil
+        }
+
+        return OuterContentPasteboardItem(representations: [
+            OuterContentPasteboardRepresentation(typeIdentifier: OuterframeHostPasteboardPayload.filePromiseTypeIdentifier,
+                                                 data: payload)
+        ])
+    }
+
+    func beginDraggingFilePromise(promiseID: UUID,
+                                  name: String,
+                                  fileSize: UInt64? = nil,
+                                  fileType: String? = nil,
+                                  operationMask: NSDragOperation = .copy,
+                                  previewPNGData: Data? = nil,
+                                  previewSize: CGSize? = nil) {
+        guard let pasteboardItem = filePromisePasteboardItem(promiseID: promiseID,
+                                                             name: name,
+                                                             fileSize: fileSize,
+                                                             fileType: fileType) else {
+            return
+        }
+        beginDraggingPasteboardItem(pasteboardItem,
+                                    operationMask: operationMask,
+                                    previewPNGData: previewPNGData,
+                                    previewSize: previewSize)
+    }
+
+    func releaseDroppedFileAccess(_ accessID: UUID) {
+        Task {
+            try? await socket.send(ContentToBrowserMessage.releaseDroppedFileAccess(accessID: accessID).encode())
+        }
+    }
+
+    func sendFilePromiseWriteResponse(requestID: UUID,
+                                      promiseID: UUID,
+                                      localPath: String,
+                                      deleteWhenDone: Bool = true) {
+        Task {
+            try? await socket.send(ContentToBrowserMessage.filePromiseWriteResponse(
+                requestID: requestID,
+                promiseID: promiseID,
+                success: true,
+                localPath: localPath,
+                deleteWhenDone: deleteWhenDone,
+                errorMessage: nil
+            ).encode())
+        }
+    }
+
+    func sendFilePromiseWriteFailure(requestID: UUID,
+                                     promiseID: UUID,
+                                     errorMessage: String) {
+        Task {
+            try? await socket.send(ContentToBrowserMessage.filePromiseWriteResponse(
+                requestID: requestID,
+                promiseID: promiseID,
+                success: false,
+                localPath: nil,
+                deleteWhenDone: false,
+                errorMessage: errorMessage
             ).encode())
         }
     }
@@ -489,17 +809,13 @@ struct OuterframeContentInputMode: OptionSet, Sendable {
     var allowsRawKeys: Bool { contains(.rawKeys) }
 }
 
-/// Describes whether the plugin can currently satisfy copy/paste commands.
+/// Describes whether the plugin can currently satisfy copy/cut commands.
 struct OuterframeContentEditingCapabilities: Sendable {
     var canCopy: Bool
     var canCut: Bool
-    var acceptablePasteboardTypeIdentifiers: [String]
 
-    init(canCopy: Bool,
-         canCut: Bool,
-         acceptablePasteboardTypeIdentifiers: [String]) {
+    init(canCopy: Bool, canCut: Bool) {
         self.canCopy = canCopy
         self.canCut = canCut
-        self.acceptablePasteboardTypeIdentifiers = acceptablePasteboardTypeIdentifiers
     }
 }

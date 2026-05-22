@@ -102,8 +102,17 @@ enum BrowserToContentMessage {
     case systemAppearanceUpdate(appearance: NSAppearance)
     case windowActiveUpdate(isActive: Bool)
     case viewFocusChanged(isFocused: Bool)
-    case copySelectedPasteboardRequest(requestID: UUID)
-    case pasteboardContentDelivered(items: [OuterframeContentPasteboardItem])
+    case selectionToPasteboardCopyRequest(requestID: UUID)
+    case selectionToPasteboardCutRequest(requestID: UUID)
+    case pasteboardContentPasted(items: [OuterframeContentPasteboardItem])
+    case pasteboardContentDropped(point: CGPoint, items: [OuterframeContentPasteboardItem])
+    case pasteboardDropHitTestRequest(requestID: UUID,
+                                      point: CGPoint,
+                                      pasteboardTypes: [String],
+                                      operationMask: UInt32,
+                                      modifierFlags: UInt64)
+    case pasteboardAccessResponse(requestID: UUID, granted: Bool, items: [OuterframeContentPasteboardItem])
+    case filePromiseWriteRequest(requestID: UUID, promiseID: UUID)
     case accessibilitySnapshotRequest(requestID: UUID)
     case historyEntryAccepted(entryID: UUID, url: String)
     case historyEntryRejected(entryID: UUID, errorMessage: String)
@@ -357,20 +366,53 @@ enum BrowserToContentMessage {
             payload.append(uint8: isFocused ? 1 << 0 : 0)
             return makeBrowserToContentFrame(type: .viewFocusChanged, payload: payload)
 
-        case .copySelectedPasteboardRequest(let requestID):
+        case .selectionToPasteboardCopyRequest(let requestID):
             var payload = Data(capacity: 16)
             payload.append(uuid: requestID)
-            return makeBrowserToContentFrame(type: .copySelectedPasteboardRequest, payload: payload)
+            return makeBrowserToContentFrame(type: .selectionToPasteboardCopyRequest, payload: payload)
 
-        case .pasteboardContentDelivered(let items):
+        case .selectionToPasteboardCutRequest(let requestID):
+            var payload = Data(capacity: 16)
+            payload.append(uuid: requestID)
+            return makeBrowserToContentFrame(type: .selectionToPasteboardCutRequest, payload: payload)
+
+        case .pasteboardContentPasted(let items):
+            let payload = try encodePasteboardItems(items)
+            return makeBrowserToContentFrame(type: .pasteboardContentPasted, payload: payload)
+
+        case .pasteboardContentDropped(let point, let items):
             var payload = OffsetPayloadBuilder()
-            let clampedCount = UInt16(min(items.count, Int(UInt16.max)))
+            payload.append(float64: point.x)
+            payload.append(float64: point.y)
+            try appendPasteboardItems(items, to: &payload)
+            return makeBrowserToContentFrame(type: .pasteboardContentDropped, payload: try payload.finalize())
+
+        case .pasteboardDropHitTestRequest(let requestID, let point, let pasteboardTypes, let operationMask, let modifierFlags):
+            var payload = OffsetPayloadBuilder()
+            payload.append(uuid: requestID)
+            payload.append(float64: point.x)
+            payload.append(float64: point.y)
+            payload.append(uint32: operationMask)
+            payload.append(uint64: modifierFlags)
+            let clampedCount = UInt16(min(pasteboardTypes.count, Int(UInt16.max)))
             payload.append(uint16: clampedCount)
-            for item in items.prefix(Int(clampedCount)) {
-                try payload.append(stringReference: item.typeIdentifier)
-                try payload.append(dataReference: item.data)
+            for identifier in pasteboardTypes.prefix(Int(clampedCount)) {
+                try payload.append(stringReference: identifier)
             }
-            return makeBrowserToContentFrame(type: .pasteboardContentDelivered, payload: try payload.finalize())
+            return makeBrowserToContentFrame(type: .pasteboardDropHitTestRequest, payload: try payload.finalize())
+
+        case .pasteboardAccessResponse(let requestID, let granted, let items):
+            var payload = OffsetPayloadBuilder()
+            payload.append(uuid: requestID)
+            payload.append(uint8: granted ? 1 << 0 : 0)
+            try appendPasteboardItems(items, to: &payload)
+            return makeBrowserToContentFrame(type: .pasteboardAccessResponse, payload: try payload.finalize())
+
+        case .filePromiseWriteRequest(let requestID, let promiseID):
+            var payload = Data(capacity: 32)
+            payload.append(uuid: requestID)
+            payload.append(uuid: promiseID)
+            return makeBrowserToContentFrame(type: .filePromiseWriteRequest, payload: payload)
 
         case .accessibilitySnapshotRequest(let requestID):
             var payload = Data(capacity: 16)
@@ -729,26 +771,69 @@ enum BrowserToContentMessage {
             }
             return .viewFocusChanged(isFocused: raw & (1 << 0) != 0)
 
-        case .copySelectedPasteboardRequest:
+        case .selectionToPasteboardCopyRequest:
             guard let requestID = cursor.readUUID() else {
                 throw OuterframeContentSocketMessageError.truncatedPayload
             }
-            return .copySelectedPasteboardRequest(requestID: requestID)
+            return .selectionToPasteboardCopyRequest(requestID: requestID)
 
-        case .pasteboardContentDelivered:
-            guard let count = cursor.readUInt16() else {
+        case .selectionToPasteboardCutRequest:
+            guard let requestID = cursor.readUUID() else {
                 throw OuterframeContentSocketMessageError.truncatedPayload
             }
-            var items: [OuterframeContentPasteboardItem] = []
-            items.reserveCapacity(Int(count))
-            for _ in 0..<count {
-                guard let identifier = cursor.readStringReference(),
-                      let data = cursor.readDataReference() else {
+            return .selectionToPasteboardCutRequest(requestID: requestID)
+
+        case .pasteboardContentPasted:
+            let items = try readPasteboardItems(cursor: &cursor)
+            return .pasteboardContentPasted(items: items)
+
+        case .pasteboardContentDropped:
+            guard let x = cursor.readFloat64(),
+                  let y = cursor.readFloat64() else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            let items = try readPasteboardItems(cursor: &cursor)
+            return .pasteboardContentDropped(point: CGPoint(x: x, y: y), items: items)
+
+        case .pasteboardDropHitTestRequest:
+            guard let requestID = cursor.readUUID(),
+                  let x = cursor.readFloat64(),
+                  let y = cursor.readFloat64(),
+                  let operationMask = cursor.readUInt32(),
+                  let modifierFlags = cursor.readUInt64(),
+                  let typeCount = cursor.readUInt16() else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            var pasteboardTypes: [String] = []
+            pasteboardTypes.reserveCapacity(Int(typeCount))
+            for _ in 0..<typeCount {
+                guard let identifier = cursor.readStringReference() else {
                     throw OuterframeContentSocketMessageError.truncatedPayload
                 }
-                items.append(OuterframeContentPasteboardItem(typeIdentifier: identifier, data: data))
+                pasteboardTypes.append(identifier)
             }
-            return .pasteboardContentDelivered(items: items)
+            return .pasteboardDropHitTestRequest(requestID: requestID,
+                                                 point: CGPoint(x: x, y: y),
+                                                 pasteboardTypes: pasteboardTypes,
+                                                 operationMask: operationMask,
+                                                 modifierFlags: modifierFlags)
+
+        case .pasteboardAccessResponse:
+            guard let requestID = cursor.readUUID(),
+                  let flags = cursor.readUInt8() else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            let items = try readPasteboardItems(cursor: &cursor)
+            return .pasteboardAccessResponse(requestID: requestID,
+                                             granted: flags & (1 << 0) != 0,
+                                             items: items)
+
+        case .filePromiseWriteRequest:
+            guard let requestID = cursor.readUUID(),
+                  let promiseID = cursor.readUUID() else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            return .filePromiseWriteRequest(requestID: requestID, promiseID: promiseID)
 
         case .accessibilitySnapshotRequest:
             guard let requestID = cursor.readUUID() else {
@@ -810,12 +895,32 @@ enum ContentToBrowserMessage {
     case cursorUpdate(cursorType: UInt8)
     case inputModeUpdate(inputMode: UInt8)
     case showContextMenu(attributedTextData: Data, locationX: CGFloat, locationY: CGFloat)
-    case showContextMenuItems(menuID: UUID, locationX: CGFloat, locationY: CGFloat, items: [OuterframeContextMenuItem])
+    case showContextMenuItems(menuID: UUID,
+                              locationX: CGFloat,
+                              locationY: CGFloat,
+                              attributedTextData: Data?,
+                              items: [OuterframeContextMenuItem])
     case showDefinition(attributedTextData: Data, locationX: CGFloat, locationY: CGFloat)
     case textCursorUpdate(cursors: [OuterframeContentTextCursorSnapshot])
-    case copySelectedPasteboardResponse(requestID: UUID, items: [OuterframeContentPasteboardItem])
+    case selectionToPasteboardResponse(requestID: UUID, items: [OuterframeContentPasteboardItem])
+    case pasteboardAccessRequest(requestID: UUID,
+                                 operation: OuterframePasteboardAccessOperation,
+                                 pasteboardTypes: [String],
+                                 items: [OuterframeContentPasteboardItem])
+    case beginDraggingPasteboardItems(items: [OuterframeContentDraggingItem], operationMask: UInt32)
+    case releaseDroppedFileAccess(accessID: UUID)
+    case filePromiseWriteResponse(requestID: UUID,
+                                  promiseID: UUID,
+                                  success: Bool,
+                                  localPath: String?,
+                                  deleteWhenDone: Bool,
+                                  errorMessage: String?)
     case openNewWindow(url: String, displayString: String?, preferredSize: CGSize?)
-    case setPasteboardCapabilities(canCopy: Bool, canCut: Bool, pasteboardTypes: [String])
+    case setEditingCapabilities(canCopy: Bool, canCut: Bool)
+    case setPasteboardDropBehaviorUniform([String])
+    case setAcceptedPasteboardPasteTypes([String])
+    case setPasteboardDropBehaviorHitTest
+    case pasteboardDropHitTestResponse(requestID: UUID, operationMask: UInt32)
     case accessibilitySnapshotResponse(requestID: UUID, snapshotData: Data?)
     case accessibilityTreeChanged(notificationMask: UInt8)
     case hapticFeedback(style: UInt8)
@@ -852,13 +957,17 @@ enum ContentToBrowserMessage {
             try payload.append(dataReference: attributedTextData)
             return makeContentToBrowserFrame(type: .showContextMenu, payload: try payload.finalize())
 
-        case .showContextMenuItems(let menuID, let locationX, let locationY, let items):
+        case .showContextMenuItems(let menuID, let locationX, let locationY, let attributedTextData, let items):
             var payload = OffsetPayloadBuilder()
             payload.append(uuid: menuID)
             payload.append(float64: locationX)
             payload.append(float64: locationY)
+            var flags: UInt8 = 0
+            if attributedTextData != nil { flags |= 1 << 0 }
+            payload.append(uint8: flags)
             let clampedCount = UInt16(min(items.count, Int(UInt16.max)))
             payload.append(uint16: clampedCount)
+            try payload.append(dataReference: attributedTextData ?? Data())
             for item in items.prefix(Int(clampedCount)) {
                 var flags: UInt8 = 0
                 if item.isEnabled { flags |= 1 << 0 }
@@ -891,16 +1000,48 @@ enum ContentToBrowserMessage {
             }
             return makeContentToBrowserFrame(type: .textCursorUpdate, payload: payload)
 
-        case .copySelectedPasteboardResponse(let requestID, let items):
+        case .selectionToPasteboardResponse(let requestID, let items):
             var payload = OffsetPayloadBuilder()
             payload.append(uuid: requestID)
-            let clampedCount = UInt16(min(items.count, Int(UInt16.max)))
-            payload.append(uint16: clampedCount)
-            for item in items.prefix(Int(clampedCount)) {
-                try payload.append(stringReference: item.typeIdentifier)
-                try payload.append(dataReference: item.data)
+            try appendPasteboardItems(items, to: &payload)
+            return makeContentToBrowserFrame(type: .selectionToPasteboardResponse, payload: try payload.finalize())
+
+        case .pasteboardAccessRequest(let requestID, let operation, let pasteboardTypes, let items):
+            var payload = OffsetPayloadBuilder()
+            payload.append(uuid: requestID)
+            payload.append(uint8: operation.rawValue)
+            let clampedTypeCount = UInt16(min(pasteboardTypes.count, Int(UInt16.max)))
+            let clampedItemCount = UInt16(min(items.count, Int(UInt16.max)))
+            payload.append(uint16: clampedTypeCount)
+            payload.append(uint16: clampedItemCount)
+            for identifier in pasteboardTypes.prefix(Int(clampedTypeCount)) {
+                try payload.append(stringReference: identifier)
             }
-            return makeContentToBrowserFrame(type: .copySelectedPasteboardResponse, payload: try payload.finalize())
+            try appendPasteboardItems(items.prefix(Int(clampedItemCount)), to: &payload, includeCount: false)
+            return makeContentToBrowserFrame(type: .pasteboardAccessRequest, payload: try payload.finalize())
+
+        case .beginDraggingPasteboardItems(let items, let operationMask):
+            var payload = OffsetPayloadBuilder()
+            payload.append(uint32: operationMask)
+            try appendDraggingItems(items, to: &payload)
+            return makeContentToBrowserFrame(type: .beginDraggingPasteboardItems, payload: try payload.finalize())
+
+        case .releaseDroppedFileAccess(let accessID):
+            var payload = Data(capacity: 16)
+            payload.append(uuid: accessID)
+            return makeContentToBrowserFrame(type: .releaseDroppedFileAccess, payload: payload)
+
+        case .filePromiseWriteResponse(let requestID, let promiseID, let success, let localPath, let deleteWhenDone, let errorMessage):
+            var payload = OffsetPayloadBuilder()
+            payload.append(uuid: requestID)
+            payload.append(uuid: promiseID)
+            var flags: UInt8 = 0
+            if success { flags |= 1 << 0 }
+            if deleteWhenDone { flags |= 1 << 1 }
+            payload.append(uint8: flags)
+            try payload.append(stringReference: localPath ?? "")
+            try payload.append(stringReference: errorMessage ?? "")
+            return makeContentToBrowserFrame(type: .filePromiseWriteResponse, payload: try payload.finalize())
 
         case .openNewWindow(let url, let displayString, let preferredSize):
             var payload = OffsetPayloadBuilder()
@@ -914,18 +1055,40 @@ enum ContentToBrowserMessage {
             payload.append(float64: preferredSize.map { Float64($0.height) } ?? 0)
             return makeContentToBrowserFrame(type: .openNewWindow, payload: try payload.finalize())
 
-        case .setPasteboardCapabilities(let canCopy, let canCut, let pasteboardTypes):
-            var payload = OffsetPayloadBuilder()
+        case .setEditingCapabilities(let canCopy, let canCut):
+            var payload = Data(capacity: 1)
             var flags: UInt8 = 0
             if canCopy { flags |= 1 << 0 }
             if canCut { flags |= 1 << 1 }
             payload.append(uint8: flags)
+            return makeContentToBrowserFrame(type: .setEditingCapabilities, payload: payload)
+
+        case .setPasteboardDropBehaviorUniform(let pasteboardTypes):
+            var payload = OffsetPayloadBuilder()
             let clampedCount = UInt16(min(pasteboardTypes.count, Int(UInt16.max)))
             payload.append(uint16: clampedCount)
             for identifier in pasteboardTypes.prefix(Int(clampedCount)) {
                 try payload.append(stringReference: identifier)
             }
-            return makeContentToBrowserFrame(type: .editingCapabilitiesUpdate, payload: try payload.finalize())
+            return makeContentToBrowserFrame(type: .setPasteboardDropBehaviorUniform, payload: try payload.finalize())
+
+        case .setAcceptedPasteboardPasteTypes(let pasteboardTypes):
+            var payload = OffsetPayloadBuilder()
+            let clampedCount = UInt16(min(pasteboardTypes.count, Int(UInt16.max)))
+            payload.append(uint16: clampedCount)
+            for identifier in pasteboardTypes.prefix(Int(clampedCount)) {
+                try payload.append(stringReference: identifier)
+            }
+            return makeContentToBrowserFrame(type: .setAcceptedPasteboardPasteTypes, payload: try payload.finalize())
+
+        case .setPasteboardDropBehaviorHitTest:
+            return makeContentToBrowserFrame(type: .setPasteboardDropBehaviorHitTest, payload: Data())
+
+        case .pasteboardDropHitTestResponse(let requestID, let operationMask):
+            var payload = Data(capacity: 20)
+            payload.append(uuid: requestID)
+            payload.append(uint32: operationMask)
+            return makeContentToBrowserFrame(type: .pasteboardDropHitTestResponse, payload: payload)
 
         case .accessibilitySnapshotResponse(let requestID, let snapshotData):
             var payload = OffsetPayloadBuilder()
@@ -1012,7 +1175,9 @@ enum ContentToBrowserMessage {
             guard let menuID = cursor.readUUID(),
                   let locationX = cursor.readFloat64(),
                   let locationY = cursor.readFloat64(),
-                  let count = cursor.readUInt16() else {
+                  let flags = cursor.readUInt8(),
+                  let count = cursor.readUInt16(),
+                  let attributedTextData = cursor.readDataReference() else {
                 throw OuterframeContentSocketMessageError.truncatedPayload
             }
             var items: [OuterframeContextMenuItem] = []
@@ -1033,6 +1198,7 @@ enum ContentToBrowserMessage {
             return .showContextMenuItems(menuID: menuID,
                                          locationX: locationX,
                                          locationY: locationY,
+                                         attributedTextData: flags & (1 << 0) != 0 ? attributedTextData : nil,
                                          items: items)
 
         case .showDefinition:
@@ -1068,25 +1234,73 @@ enum ContentToBrowserMessage {
             }
             return .textCursorUpdate(cursors: entries)
 
-        case .copySelectedPasteboardResponse:
-            guard let requestID = cursor.readUUID(),
-                  let count = cursor.readUInt16() else {
+        case .selectionToPasteboardResponse:
+            guard let requestID = cursor.readUUID() else {
                 throw OuterframeContentSocketMessageError.truncatedPayload
             }
-            var items: [OuterframeContentPasteboardItem] = []
-            items.reserveCapacity(Int(count))
-            for _ in 0..<count {
-                guard let identifier = cursor.readStringReference(),
-                      let data = cursor.readDataReference() else {
+            let items = try readPasteboardItems(cursor: &cursor)
+            return .selectionToPasteboardResponse(requestID: requestID, items: items)
+
+        case .pasteboardAccessRequest:
+            guard let requestID = cursor.readUUID(),
+                  let operationRaw = cursor.readUInt8(),
+                  let typeCount = cursor.readUInt16(),
+                  let itemCount = cursor.readUInt16(),
+                  let operation = OuterframePasteboardAccessOperation(rawValue: operationRaw) else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            var pasteboardTypes: [String] = []
+            pasteboardTypes.reserveCapacity(Int(typeCount))
+            for _ in 0..<typeCount {
+                guard let identifier = cursor.readStringReference() else {
                     throw OuterframeContentSocketMessageError.truncatedPayload
                 }
-                items.append(OuterframeContentPasteboardItem(typeIdentifier: identifier, data: data))
+                pasteboardTypes.append(identifier)
             }
-            return .copySelectedPasteboardResponse(requestID: requestID, items: items)
+            let items = try readPasteboardItems(cursor: &cursor, count: itemCount)
+            return .pasteboardAccessRequest(requestID: requestID,
+                                            operation: operation,
+                                            pasteboardTypes: pasteboardTypes,
+                                            items: items)
 
-        case .editingCapabilitiesUpdate:
-            guard let flags = cursor.readUInt8(),
-                  let count = cursor.readUInt16() else {
+        case .beginDraggingPasteboardItems:
+            guard let operationMask = cursor.readUInt32() else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            let items = try readDraggingItems(cursor: &cursor)
+            return .beginDraggingPasteboardItems(items: items, operationMask: operationMask)
+
+        case .releaseDroppedFileAccess:
+            guard let accessID = cursor.readUUID() else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            return .releaseDroppedFileAccess(accessID: accessID)
+
+        case .filePromiseWriteResponse:
+            guard let requestID = cursor.readUUID(),
+                  let promiseID = cursor.readUUID(),
+                  let flags = cursor.readUInt8(),
+                  let localPath = cursor.readStringReference(),
+                  let errorMessage = cursor.readStringReference() else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            let success = flags & (1 << 0) != 0
+            return .filePromiseWriteResponse(requestID: requestID,
+                                             promiseID: promiseID,
+                                             success: success,
+                                             localPath: localPath.isEmpty ? nil : localPath,
+                                             deleteWhenDone: flags & (1 << 1) != 0,
+                                             errorMessage: errorMessage.isEmpty ? nil : errorMessage)
+
+        case .setEditingCapabilities:
+            guard let flags = cursor.readUInt8() else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            return .setEditingCapabilities(canCopy: flags & (1 << 0) != 0,
+                                           canCut: flags & (1 << 1) != 0)
+
+        case .setPasteboardDropBehaviorUniform:
+            guard let count = cursor.readUInt16() else {
                 throw OuterframeContentSocketMessageError.truncatedPayload
             }
             var identifiers: [String] = []
@@ -1097,9 +1311,31 @@ enum ContentToBrowserMessage {
                 }
                 identifiers.append(identifier)
             }
-            return .setPasteboardCapabilities(canCopy: flags & (1 << 0) != 0,
-                                              canCut: flags & (1 << 1) != 0,
-                                              pasteboardTypes: identifiers)
+            return .setPasteboardDropBehaviorUniform(identifiers)
+
+        case .setAcceptedPasteboardPasteTypes:
+            guard let count = cursor.readUInt16() else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            var identifiers: [String] = []
+            identifiers.reserveCapacity(Int(count))
+            for _ in 0..<count {
+                guard let identifier = cursor.readStringReference() else {
+                    throw OuterframeContentSocketMessageError.truncatedPayload
+                }
+                identifiers.append(identifier)
+            }
+            return .setAcceptedPasteboardPasteTypes(identifiers)
+
+        case .setPasteboardDropBehaviorHitTest:
+            return .setPasteboardDropBehaviorHitTest
+
+        case .pasteboardDropHitTestResponse:
+            guard let requestID = cursor.readUUID(),
+                  let operationMask = cursor.readUInt32() else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            return .pasteboardDropHitTestResponse(requestID: requestID, operationMask: operationMask)
 
         case .accessibilitySnapshotResponse:
             guard let requestID = cursor.readUUID(),
@@ -1170,7 +1406,7 @@ struct OuterframeContentTextCursorSnapshot: Sendable {
     let visible: Bool
 }
 
-struct OuterframeContentPasteboardItem: Sendable {
+struct OuterframeContentPasteboardRepresentation: Sendable {
     let typeIdentifier: String
     let data: Data
 
@@ -1180,9 +1416,46 @@ struct OuterframeContentPasteboardItem: Sendable {
     }
 }
 
+struct OuterframeContentPasteboardItem: Sendable {
+    let representations: [OuterframeContentPasteboardRepresentation]
+
+    init(representations: [OuterframeContentPasteboardRepresentation]) {
+        self.representations = representations
+    }
+}
+
+struct OuterframeContentDraggingItem: Sendable {
+    let pasteboardItem: OuterframeContentPasteboardItem
+    let previewImageData: Data?
+    let previewSize: CGSize?
+
+    init(pasteboardItem: OuterframeContentPasteboardItem,
+         previewImageData: Data? = nil,
+         previewSize: CGSize? = nil) {
+        self.pasteboardItem = pasteboardItem
+        self.previewImageData = previewImageData
+        self.previewSize = previewSize
+    }
+}
+
+typealias OuterContentPasteboardItem = OuterframeContentPasteboardItem
+typealias OuterContentPasteboardRepresentation = OuterframeContentPasteboardRepresentation
+typealias OuterContentDraggingItem = OuterframeContentDraggingItem
+typealias OuterContentTextCursorSnapshot = OuterframeContentTextCursorSnapshot
+
+public enum OuterframePasteboardAccessOperation: UInt8, Sendable {
+    case read = 0
+    case write = 1
+}
+
 public enum OuterframeContextMenuItemAction: UInt8, Sendable {
     case contentCommand = 0
     case standardCopy = 1
+    case standardPaste = 2
+    case standardCut = 3
+    case standardSelectAll = 4
+    case standardLookUp = 5
+    case standardServices = 6
 }
 
 public struct OuterframeContextMenuItem: Sendable {
@@ -1240,14 +1513,19 @@ private enum BrowserToContentMessageKind: UInt16 {
     case textInputFocus = 1023
     case textCommand = 1024
     case setCursorPosition = 1025
-    case copySelectedPasteboardRequest = 1026
-    case pasteboardContentDelivered = 1027
+    case selectionToPasteboardCopyRequest = 1026
+    case pasteboardContentPasted = 1027
     case accessibilitySnapshotRequest = 1028
     case historyEntryAccepted = 1029
     case historyEntryRejected = 1030
     case historyTraversal = 1031
     case historyContextUpdate = 1032
     case contextMenuItemSelected = 1033
+    case pasteboardAccessResponse = 1034
+    case pasteboardContentDropped = 1035
+    case selectionToPasteboardCutRequest = 1037
+    case pasteboardDropHitTestRequest = 1038
+    case filePromiseWriteRequest = 1039
 
     // Assign new indices in contiguous blocks to make the switch statement more efficient
 }
@@ -1261,8 +1539,8 @@ private enum ContentToBrowserMessageKind: UInt16 {
     case showContextMenu = 2005
     case showDefinition = 2006
     case hapticFeedback = 2007
-    case copySelectedPasteboardResponse = 2008
-    case editingCapabilitiesUpdate = 2009
+    case selectionToPasteboardResponse = 2008
+    case setEditingCapabilities = 2009
     case accessibilitySnapshotResponse = 2010
     case accessibilityTreeChanged = 2011
     case openNewWindow = 2012
@@ -1270,6 +1548,14 @@ private enum ContentToBrowserMessageKind: UInt16 {
     case historyReplaceEntry = 2014
     case historyGo = 2015
     case showContextMenuItems = 2016
+    case pasteboardAccessRequest = 2017
+    case beginDraggingPasteboardItems = 2018
+    case setPasteboardDropBehaviorUniform = 2021
+    case setAcceptedPasteboardPasteTypes = 2022
+    case pasteboardDropHitTestResponse = 2023
+    case setPasteboardDropBehaviorHitTest = 2024
+    case releaseDroppedFileAccess = 2026
+    case filePromiseWriteResponse = 2027
 
     // Assign new indices in contiguous blocks to make the switch statement more efficient
 }
@@ -1292,6 +1578,122 @@ private func makeContentToBrowserFrame(type: ContentToBrowserMessageKind, payloa
     frame.append(uint16: type.rawValue)
     frame.append(payload)
     return frame
+}
+
+private func appendPasteboardItems<S: Sequence>(_ items: S,
+                                                to payload: inout OffsetPayloadBuilder,
+                                                includeCount: Bool = true) throws where S.Element == OuterframeContentPasteboardItem {
+    let items = Array(items)
+    let clampedCount = UInt16(min(items.count, Int(UInt16.max)))
+    if includeCount {
+        payload.append(uint16: clampedCount)
+    }
+    for item in items.prefix(Int(clampedCount)) {
+        let clampedRepresentationCount = UInt16(min(item.representations.count, Int(UInt16.max)))
+        payload.append(uint16: clampedRepresentationCount)
+        for representation in item.representations.prefix(Int(clampedRepresentationCount)) {
+            try payload.append(stringReference: representation.typeIdentifier)
+            try payload.append(dataReference: representation.data)
+        }
+    }
+}
+
+private func encodePasteboardItems(_ items: [OuterframeContentPasteboardItem]) throws -> Data {
+    var payload = OffsetPayloadBuilder()
+    try appendPasteboardItems(items, to: &payload)
+    return try payload.finalize()
+}
+
+private func appendDraggingItems(_ items: [OuterframeContentDraggingItem],
+                                 to payload: inout OffsetPayloadBuilder) throws {
+    let clampedCount = UInt16(min(items.count, Int(UInt16.max)))
+    payload.append(uint16: clampedCount)
+    for item in items.prefix(Int(clampedCount)) {
+        let clampedRepresentationCount = UInt16(min(item.pasteboardItem.representations.count, Int(UInt16.max)))
+        payload.append(uint16: clampedRepresentationCount)
+        for representation in item.pasteboardItem.representations.prefix(Int(clampedRepresentationCount)) {
+            try payload.append(stringReference: representation.typeIdentifier)
+            try payload.append(dataReference: representation.data)
+        }
+        let hasPreview = item.previewImageData != nil
+        payload.append(uint8: hasPreview ? 1 << 0 : 0)
+        try payload.append(dataReference: item.previewImageData ?? Data())
+        payload.append(float64: item.previewSize.map { Double($0.width) } ?? 0)
+        payload.append(float64: item.previewSize.map { Double($0.height) } ?? 0)
+    }
+}
+
+private func readPasteboardItems(cursor: inout DataCursor,
+                                 count providedCount: UInt16? = nil) throws -> [OuterframeContentPasteboardItem] {
+    let count: UInt16
+    if let providedCount {
+        count = providedCount
+    } else {
+        guard let readCount = cursor.readUInt16() else {
+            throw OuterframeContentSocketMessageError.truncatedPayload
+        }
+        count = readCount
+    }
+    var items: [OuterframeContentPasteboardItem] = []
+    items.reserveCapacity(Int(count))
+    for _ in 0..<count {
+        guard let representationCount = cursor.readUInt16() else {
+            throw OuterframeContentSocketMessageError.truncatedPayload
+        }
+        var representations: [OuterframeContentPasteboardRepresentation] = []
+        representations.reserveCapacity(Int(representationCount))
+        for _ in 0..<representationCount {
+            guard let identifier = cursor.readStringReference(),
+                  let data = cursor.readDataReference() else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            representations.append(OuterframeContentPasteboardRepresentation(typeIdentifier: identifier, data: data))
+        }
+        items.append(OuterframeContentPasteboardItem(representations: representations))
+    }
+    return items
+}
+
+private func readDraggingItems(cursor: inout DataCursor) throws -> [OuterframeContentDraggingItem] {
+    guard let count = cursor.readUInt16() else {
+        throw OuterframeContentSocketMessageError.truncatedPayload
+    }
+    var items: [OuterframeContentDraggingItem] = []
+    items.reserveCapacity(Int(count))
+    for _ in 0..<count {
+        guard let representationCount = cursor.readUInt16() else {
+            throw OuterframeContentSocketMessageError.truncatedPayload
+        }
+        var representations: [OuterframeContentPasteboardRepresentation] = []
+        representations.reserveCapacity(Int(representationCount))
+        for _ in 0..<representationCount {
+            guard let identifier = cursor.readStringReference(),
+                  let data = cursor.readDataReference() else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            representations.append(OuterframeContentPasteboardRepresentation(typeIdentifier: identifier, data: data))
+        }
+        guard
+              let flags = cursor.readUInt8(),
+              let previewImageData = cursor.readDataReference(),
+              let previewWidth = cursor.readFloat64(),
+              let previewHeight = cursor.readFloat64() else {
+            throw OuterframeContentSocketMessageError.truncatedPayload
+        }
+        let hasPreview = flags & (1 << 0) != 0
+        let previewSize: CGSize?
+        if hasPreview, previewWidth > 0, previewHeight > 0 {
+            previewSize = CGSize(width: previewWidth, height: previewHeight)
+        } else {
+            previewSize = nil
+        }
+        items.append(OuterframeContentDraggingItem(
+            pasteboardItem: OuterframeContentPasteboardItem(representations: representations),
+            previewImageData: hasPreview ? previewImageData : nil,
+            previewSize: previewSize
+        ))
+    }
+    return items
 }
 
 private func makeMouseEventFrame(type: BrowserToContentMessageKind,
@@ -1559,6 +1961,3 @@ fileprivate extension Data {
     }
 
 }
-
-typealias OuterContentTextCursorSnapshot = OuterframeContentTextCursorSnapshot
-typealias OuterContentPasteboardItem = OuterframeContentPasteboardItem

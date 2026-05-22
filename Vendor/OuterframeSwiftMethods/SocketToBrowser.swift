@@ -43,7 +43,8 @@ actor SocketToBrowser {
     nonisolated(unsafe) weak var delegate: SocketToBrowserDelegate?
 
     init() {
-        queue = DispatchQueue(label: "dev.outergroup.outerframeswiftmethods.socket") as! DispatchSerialQueue
+        queue = DispatchQueue(label: "dev.outergroup.outerframeswiftmethods.socket",
+                              qos: .userInteractive) as! DispatchSerialQueue
     }
 
     func start(withFileDescriptor fd: Int32) {
@@ -168,7 +169,9 @@ actor SocketToBrowser {
 
     private func notifyClosed() {
         if let delegate {
-            Task { await delegate.socketToBrowserDidClose(self) }
+            Task(priority: .high) {
+                await delegate.socketToBrowserDidClose(self)
+            }
         }
     }
 
@@ -190,7 +193,9 @@ actor SocketToBrowser {
             incomingBuffer.removeSubrange(incomingBuffer.startIndex..<messageEnd)
 
             if let delegate {
-                Task { await delegate.socketToBrowser(self, didReceiveMessage: message) }
+                Task(priority: .high) {
+                    await delegate.socketToBrowser(self, didReceiveMessage: message)
+                }
             }
         }
     }
