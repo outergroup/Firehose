@@ -507,6 +507,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     private let outerframeHost: OuterframeHost
     private let appConnection: OuterframeAppConnection
     private var retainedSelf: TraceHandler?
+    private var accessibilityNotificationScheduled = false
     private lazy var filterInputController: SingleLineTextInputController<TraceHandler> = {
         let controller = SingleLineTextInputController<TraceHandler>(identifier: Self.filterFieldID)
         controller.delegate = self
@@ -1086,6 +1087,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             layoutToolbarTitle()
             updateStatusText()
         }
+        notifyAccessibilityLayoutChanged()
     }
 
     private func processTimelineHeight(for contentHeight: CGFloat) -> CGFloat {
@@ -2968,6 +2970,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             updateTimelineRowLayerCount()
             layoutTimelineRows()
         }
+        notifyAccessibilityLayoutChanged()
     }
 
     private func jumpToEvent(for pid: Int,
@@ -3093,6 +3096,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                 row.background.opacity = (renderedRow.globalIndex % 2 == 0) ? 0.38 : 0
             }
         }
+        notifyAccessibilityLayoutChanged()
     }
 
     private func updateStatusText() {
@@ -3127,6 +3131,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                 }
             }
         }
+        notifyAccessibilityLayoutChanged()
     }
 
     private func clampScrollOffset() {
@@ -3348,36 +3353,196 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     }
 
     private func accessibilitySnapshot() -> OuterframeAccessibilitySnapshot? {
-        var children: [OuterframeAccessibilityNode] = [
-            OuterframeAccessibilityNode(identifier: 1,
-                                        role: .staticText,
-                                        frame: toolbarLayer.convert(statusLayer.frame, to: rootLayer),
-                                        label: statusLayer.string as? String ?? "")
-        ]
+        var nextIdentifier: UInt32 = 1
+        var children: [OuterframeAccessibilityNode] = []
 
-        for (index, row) in rowLayers.enumerated() where !row.container.isHidden {
-            guard let renderedRow = eventForRenderedRow(at: index) else { continue }
-            let event = renderedRow.event
-            let frameInRoot = rowsClipLayer.convert(row.container.frame, to: rootLayer)
-            children.append(OuterframeAccessibilityNode(identifier: UInt32(1000 + index),
-                                                        role: .staticText,
-                                                        frame: frameInRoot,
-                                                        label: "\(event.time) \(event.type) \(event.pid) \(event.process) \(event.detail)"))
+        children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                          role: .staticText,
+                                          frame: toolbarLayer.convert(titleLayer.frame, to: rootLayer),
+                                          label: titleLayer.string as? String ?? "Outer Trace"))
+        children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                          role: .staticText,
+                                          frame: toolbarLayer.convert(statusLayer.frame, to: rootLayer),
+                                          label: statusLayer.string as? String ?? ""))
+        children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                          role: .button,
+                                          frame: toolbarLayer.convert(pauseButtonLayer.frame, to: rootLayer),
+                                          label: isCapturePaused ? "Resume tracing" : "Pause tracing",
+                                          hint: capturePauseReason == .lowStorage ? "Tracing paused because storage is low" : nil,
+                                          isEnabled: capturePauseReason != .lowStorage))
+        children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                          role: .button,
+                                          frame: toolbarLayer.convert(clearLogButtonLayer.frame, to: rootLayer),
+                                          label: "Clear log"))
+        children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                          role: .button,
+                                          frame: toolbarLayer.convert(filterPillLayer.frame, to: rootLayer),
+                                          label: "Filters",
+                                          value: currentFilterSummary(),
+                                          hint: isFilterPanelExpanded ? "Filter editor expanded" : "Open filter editor"))
+        if isFilterPanelExpanded {
+            children.append(buildFilterAccessibilityNode(nextIdentifier: &nextIdentifier))
         }
-
-        for (index, row) in processTimelineRows.prefix(20).enumerated() {
-            let process = row.process
-            children.append(OuterframeAccessibilityNode(identifier: UInt32(3000 + index),
-                                                        role: .staticText,
-                                                        frame: processTimelineLayer.frame,
-                                                        label: "\(process.process) pid \(process.pid), \(process.eventCount) events"))
-        }
+        children.append(buildEventTableAccessibilityNode(nextIdentifier: &nextIdentifier))
+        children.append(buildProcessTimelineAccessibilityNode(nextIdentifier: &nextIdentifier))
 
         let rootNode = OuterframeAccessibilityNode(identifier: 0,
                                                    role: .container,
-                                                   frame: rootLayer.frame,
+                                                   frame: rootLayer.bounds,
                                                    label: "Trace event monitor",
                                                    children: children)
         return OuterframeAccessibilitySnapshot(rootNodes: [rootNode])
+    }
+
+    private func buildFilterAccessibilityNode(nextIdentifier: inout UInt32) -> OuterframeAccessibilityNode {
+        var children: [OuterframeAccessibilityNode] = []
+        for (index, clause) in filterClauses.enumerated() where index < filterRowLayers.count {
+            let label = "\(clause.column.title) \(clause.operation.title) \(clause.value.isEmpty ? "empty value" : clause.value)"
+            children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                             role: .row,
+                                             frame: filterPanelLayer.convert(filterRowLayers[index].frame, to: rootLayer),
+                                             label: label,
+                                             hint: index == activeFilterIndex ? "Active filter row" : nil))
+        }
+        children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                         role: .textField,
+                                         frame: filterPanelLayer.convert(filterValueLayers.indices.contains(activeFilterIndex) ? filterValueLayers[activeFilterIndex].frame : filterAddLayer.frame, to: rootLayer),
+                                         label: "Filter value",
+                                         value: activeFilterValue()))
+        children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                         role: .button,
+                                         frame: filterPanelLayer.convert(filterAddLayer.frame, to: rootLayer),
+                                         label: "Add filter"))
+        return accessibilityNode(nextIdentifier: &nextIdentifier,
+                                 role: .container,
+                                 frame: filterPanelLayer.frame,
+                                 label: "Filter editor",
+                                 children: children)
+    }
+
+    private func buildEventTableAccessibilityNode(nextIdentifier: inout UInt32) -> OuterframeAccessibilityNode {
+        var rows: [OuterframeAccessibilityNode] = []
+        for (index, row) in rowLayers.enumerated() where !row.container.isHidden {
+            guard let renderedRow = eventForRenderedRow(at: index) else { continue }
+            let event = renderedRow.event
+            let cells = [
+                accessibilityNode(nextIdentifier: &nextIdentifier,
+                                  role: .cell,
+                                  frame: row.container.convert(row.time.frame, to: rootLayer),
+                                  label: "Time",
+                                  value: event.time),
+                accessibilityNode(nextIdentifier: &nextIdentifier,
+                                  role: .cell,
+                                  frame: row.container.convert(row.type.frame, to: rootLayer),
+                                  label: "Event",
+                                  value: event.type),
+                accessibilityNode(nextIdentifier: &nextIdentifier,
+                                  role: .cell,
+                                  frame: row.container.convert(row.pid.frame, to: rootLayer),
+                                  label: "PID",
+                                  value: event.pid > 0 ? String(event.pid) : ""),
+                accessibilityNode(nextIdentifier: &nextIdentifier,
+                                  role: .cell,
+                                  frame: row.container.convert(row.process.frame, to: rootLayer),
+                                  label: "Process",
+                                  value: event.process),
+                accessibilityNode(nextIdentifier: &nextIdentifier,
+                                  role: .cell,
+                                  frame: row.container.convert(row.path.frame, to: rootLayer),
+                                  label: "Path",
+                                  value: event.path),
+                accessibilityNode(nextIdentifier: &nextIdentifier,
+                                  role: .cell,
+                                  frame: row.container.convert(row.detail.frame, to: rootLayer),
+                                  label: "Detail",
+                                  value: event.detail)
+            ]
+            rows.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                         role: .row,
+                                         frame: rowsClipLayer.convert(row.container.frame, to: rootLayer),
+                                         label: "\(event.time) \(event.type) \(event.pid) \(event.process) \(event.path) \(event.detail)",
+                                         children: cells))
+        }
+        return accessibilityNode(nextIdentifier: &nextIdentifier,
+                                 role: .table,
+                                 frame: tableLayer.convert(rowsClipLayer.frame, to: rootLayer),
+                                 label: "Trace events",
+                                 children: rows,
+                                 rowCount: totalRows,
+                                 columnCount: columns.count)
+    }
+
+    private func buildProcessTimelineAccessibilityNode(nextIdentifier: inout UInt32) -> OuterframeAccessibilityNode {
+        var rows: [OuterframeAccessibilityNode] = []
+        let visibleStart = processTimelineVisibleStartIndex()
+        for (layerIndex, row) in timelineRowLayers.enumerated() where !row.container.isHidden {
+            let processIndex = visibleStart + layerIndex
+            guard processIndex < processTimelineRows.count else { continue }
+            let process = processTimelineRows[processIndex].process
+            let processName = process.process.isEmpty ? "pid-\(process.pid)" : process.process
+            let label = "\(processName), pid \(process.pid), \(formatCount(Int(process.eventCount))) events"
+            let cells = [
+                accessibilityNode(nextIdentifier: &nextIdentifier,
+                                  role: .cell,
+                                  frame: row.container.convert(row.name.frame, to: rootLayer),
+                                  label: "Process",
+                                  value: processName),
+                accessibilityNode(nextIdentifier: &nextIdentifier,
+                                  role: .cell,
+                                  frame: row.container.convert(row.pid.frame, to: rootLayer),
+                                  label: "PID",
+                                  value: String(process.pid)),
+                accessibilityNode(nextIdentifier: &nextIdentifier,
+                                  role: .cell,
+                                  frame: row.container.convert(row.events.frame, to: rootLayer),
+                                  label: "Events",
+                                  value: formatCount(Int(process.eventCount)))
+            ]
+            rows.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                         role: .row,
+                                         frame: processTimelineRowsClipLayer.convert(row.container.frame, to: rootLayer),
+                                         label: label,
+                                         children: cells))
+        }
+        return accessibilityNode(nextIdentifier: &nextIdentifier,
+                                 role: .table,
+                                 frame: processTimelineLayer.frame,
+                                 label: "Process timeline",
+                                 children: rows,
+                                 rowCount: processTimelineRows.count,
+                                 columnCount: 3)
+    }
+
+    private func accessibilityNode(nextIdentifier: inout UInt32,
+                                   role: OuterframeAccessibilityRole,
+                                   frame: CGRect,
+                                   label: String? = nil,
+                                   value: String? = nil,
+                                   hint: String? = nil,
+                                   children: [OuterframeAccessibilityNode] = [],
+                                   rowCount: Int? = nil,
+                                   columnCount: Int? = nil,
+                                   isEnabled: Bool = true) -> OuterframeAccessibilityNode {
+        let identifier = nextIdentifier
+        nextIdentifier = nextIdentifier == UInt32.max ? 1 : nextIdentifier + 1
+        return OuterframeAccessibilityNode(identifier: identifier,
+                                           role: role,
+                                           frame: frame,
+                                           label: label,
+                                           value: value,
+                                           hint: hint,
+                                           children: children,
+                                           rowCount: rowCount,
+                                           columnCount: columnCount,
+                                           isEnabled: isEnabled)
+    }
+
+    private func notifyAccessibilityLayoutChanged() {
+        guard didRegisterLayer, !accessibilityNotificationScheduled else { return }
+        accessibilityNotificationScheduled = true
+        Task { @MainActor in
+            accessibilityNotificationScheduled = false
+            outerframeHost.notifyAccessibilityTreeChanged(.layoutChanged)
+        }
     }
 }
