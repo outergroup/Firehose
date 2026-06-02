@@ -553,6 +553,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     private var filterValueLayers: [CATextLayer] = []
     private var filterRemoveLayers: [CATextLayer] = []
     private let filterSelectionLayer = CALayer()
+    private let filterCaretLayer = CALayer()
     private let filterAddLayer = CATextLayer()
     private var headerTextLayers: [CATextLayer] = []
     private var headerSeparatorLayers: [CALayer] = []
@@ -638,6 +639,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     private let filterPanelSize = CGSize(width: 460, height: 238)
     private let filterValueFont = NSFont.systemFont(ofSize: 12, weight: .regular)
     private let filterCaretWidth: CGFloat = 1
+    private let filterCaretBlinkAnimationKey = "filterCaretBlink"
     private let maxFilterClauseRows = 6
 
     private let columns: [(title: String, width: CGFloat, alignment: CATextLayerAlignmentMode)] = [
@@ -939,6 +941,9 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         filterAddLayer.contentsScale = 2
         filterAddLayer.string = "+ Add filter"
         filterPanelLayer.addSublayer(filterAddLayer)
+        filterCaretLayer.backgroundColor = NSColor.textColor.cgColor
+        filterCaretLayer.isHidden = true
+        filterPanelLayer.addSublayer(filterCaretLayer)
 
         headerTextLayers = columns.map { column in
             let layer = makeTextLayer(size: 12, weight: .semibold, alignment: column.alignment)
@@ -2331,8 +2336,11 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
               activeFilterIndex >= 0,
               activeFilterIndex < filterValueLayers.count,
               activeFilterIndex < filterClauses.count,
+              filterInputController.isFocused,
               !filterInputController.hasSelection else {
-            outerframeHost.sendTextCursorUpdate(cursors: [])
+            filterCaretLayer.isHidden = true
+            filterCaretLayer.removeAnimation(forKey: filterCaretBlinkAnimationKey)
+            outerframeHost.sendTextInputGeometryUpdate(nil)
             updateEditingCapabilities()
             return
         }
@@ -2351,15 +2359,28 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                                     y: valueLayer.frame.minY,
                                     width: cursorWidth,
                                     height: valueLayer.frame.height)
+        filterCaretLayer.frame = panelCaretRect
+        filterCaretLayer.isHidden = false
+        filterCaretLayer.opacity = 1
+        if filterCaretLayer.animation(forKey: filterCaretBlinkAnimationKey) == nil {
+            let animation = CABasicAnimation(keyPath: "opacity")
+            animation.fromValue = 1
+            animation.toValue = 0
+            animation.duration = 0.55
+            animation.beginTime = CACurrentMediaTime() + 0.55
+            animation.autoreverses = true
+            animation.repeatCount = .infinity
+            animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            filterCaretLayer.add(animation, forKey: filterCaretBlinkAnimationKey)
+        }
         let rootCaretRect = filterPanelLayer.convert(panelCaretRect, to: rootLayer)
         let topLeftY = rootLayer.bounds.height - rootCaretRect.origin.y - rootCaretRect.height
-        let cursor = OuterframeContentTextCursorSnapshot(fieldID: Self.filterFieldID,
-                                                         rect: CGRect(x: rootCaretRect.origin.x,
-                                                                      y: topLeftY,
-                                                                      width: rootCaretRect.width,
-                                                                      height: rootCaretRect.height),
-                                                         visible: true)
-        outerframeHost.sendTextCursorUpdate(cursors: [cursor])
+        let geometry = OuterframeContentTextInputGeometry(fieldID: Self.filterFieldID,
+                                                          rect: CGRect(x: rootCaretRect.origin.x,
+                                                                       y: topLeftY,
+                                                                       width: rootCaretRect.width,
+                                                                       height: rootCaretRect.height))
+        outerframeHost.sendTextInputGeometryUpdate(geometry)
         updateEditingCapabilities()
     }
 
@@ -3190,6 +3211,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                 filterPillTextLayer.foregroundColor = NSColor.labelColor.cgColor
                 filterPanelLayer.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.97).cgColor
                 filterPanelLayer.borderColor = NSColor.separatorColor.cgColor
+                filterCaretLayer.backgroundColor = NSColor.textColor.cgColor
                 for layer in headerTextLayers {
                     layer.foregroundColor = NSColor.secondaryLabelColor.cgColor
                 }
