@@ -1774,8 +1774,6 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         menuItems.append(OuterframeContextMenuItem(id: "copy",
                                                    title: "Copy",
                                                    action: .standardCopy))
-        menuItems.append(OuterframeContextMenuItem(id: "copy-programmatic",
-                                                   title: "Copy (programmatic)"))
 
         outerframeHost.showContextMenu(
             menuID: menuID,
@@ -1845,12 +1843,6 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                                                            title: "Services",
                                                            action: .standardServices))
             }
-            menuItems.append(OuterframeContextMenuItem(id: "paste-programmatic-separator",
-                                                       title: "",
-                                                       kind: .separator,
-                                                       isEnabled: false))
-            menuItems.append(OuterframeContextMenuItem(id: "paste-programmatic",
-                                                       title: "Paste (programmatic)"))
             let menuID = UUID()
             pendingFilterContextMenuID = menuID
             outerframeHost.showContextMenu(
@@ -1868,20 +1860,6 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     private func handleContextMenuSelection(menuID: UUID, itemID: String) {
         if pendingFilterContextMenuID == menuID {
             pendingFilterContextMenuID = nil
-            switch itemID {
-            case "paste-programmatic":
-                outerframeHost.requestPasteboardRead(
-                    typeIdentifiers: [
-                        NSPasteboard.PasteboardType.string.rawValue,
-                        NSPasteboard.PasteboardType.rtf.rawValue
-                    ]
-                ) { [weak self] granted, items in
-                    guard granted else { return }
-                    self?.handlePasteboardItemsForPaste(items)
-                }
-            default:
-                break
-            }
             return
         }
 
@@ -1903,8 +1881,6 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             addFilterClause(FilterClause(column: context.column,
                                          operation: .notEquals,
                                          value: context.value))
-        case "copy-programmatic":
-            outerframeHost.requestPasteboardWrite(items: pasteboardItemsForCopy())
         default:
             break
         }
