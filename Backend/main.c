@@ -44,10 +44,10 @@
 #define EVENT_BINARY_RECORD_SIZE 64
 #define EVENT_BINARY_MAX_COUNT 512
 #define PROCESS_TIMELINE_BINARY_MAGIC 0x50435254u
-#define PROCESS_TIMELINE_BINARY_VERSION 3
+#define PROCESS_TIMELINE_BINARY_VERSION 4
 #define PROCESS_TIMELINE_BINARY_HEADER_SIZE 64
 #define PROCESS_TIMELINE_BINARY_RECORD_SIZE 64
-#define PROCESS_TIMELINE_DOT_RECORD_SIZE 20
+#define PROCESS_TIMELINE_DOT_RECORD_SIZE 28
 #define PROCESS_TIMELINE_DOT_BUCKET_COUNT 512
 #define PROCESS_TIMELINE_DOT_MAX_COUNT 16
 #define EVENT_POSITION_BINARY_MAGIC 0x504a5254u
@@ -129,6 +129,7 @@ typedef struct {
     uint64_t event_count;
     uint8_t dot_counts[PROCESS_TIMELINE_DOT_BUCKET_COUNT];
     double dot_timestamp_sums[PROCESS_TIMELINE_DOT_BUCKET_COUNT];
+    uint64_t dot_filtered_indices[PROCESS_TIMELINE_DOT_BUCKET_COUNT];
     bool has_start;
     bool has_end;
     bool open_at_start;
@@ -1998,6 +1999,9 @@ static ProcessTimelineItem *append_process_timeline_item(ProcessTimeline *timeli
     item->start_timestamp = event->timestamp;
     item->end_timestamp = event->timestamp;
     item->last_timestamp = event->timestamp;
+    for (size_t i = 0; i < PROCESS_TIMELINE_DOT_BUCKET_COUNT; ++i) {
+        item->dot_filtered_indices[i] = UINT64_MAX;
+    }
     return item;
 }
 
@@ -2115,6 +2119,7 @@ static bool build_process_timeline(ProcessTimeline *timeline,
         }
     }
 
+    size_t filtered_index = 0;
     for (size_t i = 0; i < g_events.count; ++i) {
         TraceEvent event;
         if (!read_event_at_chronological_index(i, &event)) {
@@ -2164,11 +2169,15 @@ static bool build_process_timeline(ProcessTimeline *timeline,
                 item->dot_timestamp_sums[bucket] += event.timestamp;
                 item->dot_counts[bucket]++;
             }
+            if (item->dot_filtered_indices[bucket] == UINT64_MAX) {
+                item->dot_filtered_indices[bucket] = (uint64_t)filtered_index;
+            }
         }
 
         if (matches_filter) {
             item->event_count++;
             (*event_count_out)++;
+            filtered_index++;
         }
         if (event.timestamp < item->first_timestamp) {
             item->first_timestamp = event.timestamp;
@@ -2335,6 +2344,7 @@ static size_t build_process_timeline_binary(const EventFilter *filter, unsigned 
             write_uint32_le(buffer + record_offset + 8, (uint32_t)item->dot_counts[bucket]);
             write_double_le(buffer + record_offset + 12,
                             item->dot_timestamp_sums[bucket] / (double)item->dot_counts[bucket]);
+            write_uint64_le(buffer + record_offset + 20, item->dot_filtered_indices[bucket]);
             dot_index++;
         }
     }

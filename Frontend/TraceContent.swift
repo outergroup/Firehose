@@ -126,6 +126,7 @@ private struct TimelineEventDot {
     let bucketIndex: Int
     let count: Int
     let timestamp: Double
+    let filteredIndex: Int?
 }
 
 private struct TimelineEventDotHit {
@@ -133,6 +134,7 @@ private struct TimelineEventDotHit {
     let bucketIndex: Int
     let count: Int
     let timestamp: Double
+    let filteredIndex: Int?
     let center: CGPoint
 }
 
@@ -376,7 +378,7 @@ private func decodeProcessTimelineResponse(_ data: Data) throws -> ProcessTimeli
     let dotMaxCount = headerSize >= 64 ? Int(try data.traceUInt32(at: 60)) : 0
 
     guard magic == 0x5043_5254,
-          version == 1 || version == 2 || version == 3,
+          version == 1 || version == 2 || version == 3 || version == 4,
           headerSize >= 48,
           recordSize >= 64,
           totalProcessCountValue <= UInt64(Int.max),
@@ -407,10 +409,13 @@ private func decodeProcessTimelineResponse(_ data: Data) throws -> ProcessTimeli
             let timestamp = dotRecordSize >= 20 ?
                 try data.traceDouble(at: offset + 12) :
                 captureStart + (Double(bucketIndex) / Double(maxBucketIndex)) * duration
+            let filteredIndexValue = dotRecordSize >= 28 ? try data.traceUInt64(at: offset + 20) : UInt64.max
+            let filteredIndex = filteredIndexValue <= UInt64(Int.max) ? Int(filteredIndexValue) : nil
             eventDots.append(TimelineEventDot(pid: Int(try data.traceInt32(at: offset + 0)),
                                               bucketIndex: bucketIndex,
                                               count: Int(try data.traceUInt32(at: offset + 8)),
-                                              timestamp: timestamp))
+                                              timestamp: timestamp,
+                                              filteredIndex: filteredIndex))
         }
     }
 
@@ -1412,6 +1417,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                                               bucketIndex: dot.bucketIndex,
                                               count: dot.count,
                                               timestamp: dot.timestamp,
+                                              filteredIndex: dot.filteredIndex,
                                               center: center)
             }
         }
@@ -1469,6 +1475,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                                            bucketIndex: hoveredProcessTimelineDot.bucketIndex,
                                            count: hoveredProcessTimelineDot.count,
                                            timestamp: hoveredProcessTimelineDot.timestamp,
+                                           filteredIndex: hoveredProcessTimelineDot.filteredIndex,
                                            center: center)
             }
         }
@@ -1604,9 +1611,13 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         if let dot = clickedProcessTimelineDot(at: point) {
             hoveredProcessTimelineDot = dot
             layoutHoveredProcessTimelineDot()
-            jumpToEvent(for: dot.pid,
-                        nearTimestamp: dot.timestamp,
-                        bucketIndex: dot.bucketIndex)
+            if let filteredIndex = dot.filteredIndex {
+                scrollToFilteredEventIndex(filteredIndex)
+            } else {
+                jumpToEvent(for: dot.pid,
+                            nearTimestamp: dot.timestamp,
+                            bucketIndex: dot.bucketIndex)
+            }
             return true
         }
 
@@ -2997,18 +3008,23 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         do {
             let response = try decodeEventPositionResponse(data)
             guard response.found else { return }
-            scrollOffset = CGFloat(response.index) * rowHeight
-            resetScrollPrediction()
-            clampScrollOffset()
-            lastRequestedStart = -1
-            lastRequestedCount = -1
-            lastRequestedTail = false
-            updateLayout()
-            fetchVisibleWindow(force: true)
+            scrollToFilteredEventIndex(response.index)
         } catch {
             lastErrorText = "Could not decode binary event position response"
             updateStatusText()
         }
+    }
+
+    private func scrollToFilteredEventIndex(_ index: Int) {
+        guard index >= 0 else { return }
+        scrollOffset = CGFloat(index) * rowHeight
+        resetScrollPrediction()
+        clampScrollOffset()
+        lastRequestedStart = -1
+        lastRequestedCount = -1
+        lastRequestedTail = false
+        updateLayout()
+        fetchVisibleWindow(force: true)
     }
 
     private func orderedTimelineRows(from processes: [TimelineProcess]) -> [TimelineProcessRow] {
