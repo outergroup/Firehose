@@ -916,6 +916,8 @@ enum ContentToBrowserMessage {
                                   deleteWhenDone: Bool,
                                   errorMessage: String?)
     case openNewWindow(url: String, displayString: String?, preferredSize: CGSize?)
+    case navigate(url: String)
+    case openNewTab(url: String, displayString: String?)
     case setEditingCapabilities(canCopy: Bool, canCut: Bool)
     case setPasteboardDropBehaviorUniform([String])
     case setAcceptedPasteboardPasteTypes([String])
@@ -969,13 +971,7 @@ enum ContentToBrowserMessage {
             payload.append(uint16: clampedCount)
             try payload.append(dataReference: attributedTextData ?? Data())
             for item in items.prefix(Int(clampedCount)) {
-                var flags: UInt8 = 0
-                if item.isEnabled { flags |= 1 << 0 }
-                if item.isSeparator { flags |= 1 << 1 }
-                payload.append(uint8: flags)
-                payload.append(uint8: item.action.rawValue)
-                try payload.append(stringReference: item.id)
-                try payload.append(stringReference: item.title)
+                try appendContextMenuItem(item, to: &payload)
             }
             return makeContentToBrowserFrame(type: .showContextMenuItems, payload: try payload.finalize())
 
@@ -1054,6 +1050,20 @@ enum ContentToBrowserMessage {
             payload.append(float64: preferredSize.map { Float64($0.width) } ?? 0)
             payload.append(float64: preferredSize.map { Float64($0.height) } ?? 0)
             return makeContentToBrowserFrame(type: .openNewWindow, payload: try payload.finalize())
+
+        case .navigate(let url):
+            var payload = OffsetPayloadBuilder()
+            try payload.append(stringReference: url)
+            return makeContentToBrowserFrame(type: .navigate, payload: try payload.finalize())
+
+        case .openNewTab(let url, let displayString):
+            var payload = OffsetPayloadBuilder()
+            try payload.append(stringReference: url)
+            var flags: UInt8 = 0
+            if displayString != nil { flags |= 1 << 0 }
+            payload.append(uint8: flags)
+            try payload.append(stringReference: displayString ?? "")
+            return makeContentToBrowserFrame(type: .openNewTab, payload: try payload.finalize())
 
         case .setEditingCapabilities(let canCopy, let canCut):
             var payload = Data(capacity: 1)
@@ -1183,17 +1193,7 @@ enum ContentToBrowserMessage {
             var items: [OuterframeContextMenuItem] = []
             items.reserveCapacity(Int(count))
             for _ in 0..<count {
-                guard let flags = cursor.readUInt8(),
-                      let actionRawValue = cursor.readUInt8(),
-                      let id = cursor.readStringReference(),
-                      let title = cursor.readStringReference() else {
-                    throw OuterframeContentSocketMessageError.truncatedPayload
-                }
-                items.append(OuterframeContextMenuItem(id: id,
-                                                       title: title,
-                                                       action: OuterframeContextMenuItemAction(rawValue: actionRawValue) ?? .contentCommand,
-                                                       isEnabled: flags & (1 << 0) != 0,
-                                                       isSeparator: flags & (1 << 1) != 0))
+                items.append(try readContextMenuItem(from: &cursor))
             }
             return .showContextMenuItems(menuID: menuID,
                                          locationX: locationX,
@@ -1390,6 +1390,21 @@ enum ContentToBrowserMessage {
             let preferredSize = flags & (1 << 1) != 0 ? CGSize(width: width, height: height) : nil
             return .openNewWindow(url: url, displayString: displayString,
                                   preferredSize: preferredSize)
+
+        case .navigate:
+            guard let url = cursor.readStringReference() else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            return .navigate(url: url)
+
+        case .openNewTab:
+            guard let url = cursor.readStringReference(),
+                  let flags = cursor.readUInt8(),
+                  let displayStringReference = cursor.readStringReference() else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            let displayString = flags & (1 << 0) != 0 ? displayStringReference : nil
+            return .openNewTab(url: url, displayString: displayString)
         }
     }
 }
@@ -1423,13 +1438,16 @@ struct OuterframeContentDraggingItem: Sendable {
     let pasteboardItem: OuterframeContentPasteboardItem
     let previewImageData: Data?
     let previewSize: CGSize?
+    let previewFrameOrigin: CGPoint?
 
     init(pasteboardItem: OuterframeContentPasteboardItem,
          previewImageData: Data? = nil,
-         previewSize: CGSize? = nil) {
+         previewSize: CGSize? = nil,
+         previewFrameOrigin: CGPoint? = nil) {
         self.pasteboardItem = pasteboardItem
         self.previewImageData = previewImageData
         self.previewSize = previewSize
+        self.previewFrameOrigin = previewFrameOrigin
     }
 }
 
@@ -1453,23 +1471,96 @@ public enum OuterframeContextMenuItemAction: UInt8, Sendable {
     case standardServices = 6
 }
 
+public enum OuterframeContextMenuItemKind: UInt8, Sendable {
+    case command = 0
+    case separator = 1
+    case submenu = 2
+    case label = 3
+}
+
+public enum OuterframeContextMenuItemState: UInt8, Sendable {
+    case off = 0
+    case on = 1
+    case mixed = 2
+}
+
+public enum OuterframeContextMenuTextAlignment: UInt8, Sendable {
+    case natural = 0
+    case left = 1
+    case center = 2
+    case right = 3
+}
+
+public struct OuterframeContextMenuItemStyle: Sendable {
+    public var height: Float32
+    public var topInset: Float32
+    public var leftInset: Float32
+    public var bottomInset: Float32
+    public var rightInset: Float32
+    public var fontSize: Float32
+    public var fontWeight: Float32
+    public var textColorRGBA: UInt32
+    public var alignment: OuterframeContextMenuTextAlignment
+
+    public init(height: Float32 = 0,
+                topInset: Float32 = 0,
+                leftInset: Float32 = 0,
+                bottomInset: Float32 = 0,
+                rightInset: Float32 = 0,
+                fontSize: Float32 = 0,
+                fontWeight: Float32 = 0,
+                textColorRGBA: UInt32 = 0,
+                alignment: OuterframeContextMenuTextAlignment = .natural) {
+        self.height = height
+        self.topInset = topInset
+        self.leftInset = leftInset
+        self.bottomInset = bottomInset
+        self.rightInset = rightInset
+        self.fontSize = fontSize
+        self.fontWeight = fontWeight
+        self.textColorRGBA = textColorRGBA
+        self.alignment = alignment
+    }
+}
+
 public struct OuterframeContextMenuItem: Sendable {
     public let id: String
     public let title: String
+    public let kind: OuterframeContextMenuItemKind
     public let action: OuterframeContextMenuItemAction
     public let isEnabled: Bool
-    public let isSeparator: Bool
+    public let state: OuterframeContextMenuItemState
+    public let indentationLevel: UInt16
+    public let keyEquivalent: String
+    public let keyEquivalentModifierMask: UInt32
+    public let systemImageName: String
+    public let style: OuterframeContextMenuItemStyle
+    public let children: [OuterframeContextMenuItem]
 
     public init(id: String,
                 title: String,
+                kind: OuterframeContextMenuItemKind = .command,
                 action: OuterframeContextMenuItemAction = .contentCommand,
                 isEnabled: Bool = true,
-                isSeparator: Bool = false) {
+                state: OuterframeContextMenuItemState = .off,
+                indentationLevel: UInt16 = 0,
+                keyEquivalent: String = "",
+                keyEquivalentModifierMask: UInt32 = 0,
+                systemImageName: String = "",
+                style: OuterframeContextMenuItemStyle = OuterframeContextMenuItemStyle(),
+                children: [OuterframeContextMenuItem] = []) {
         self.id = id
         self.title = title
+        self.kind = kind
         self.action = action
         self.isEnabled = isEnabled
-        self.isSeparator = isSeparator
+        self.state = state
+        self.indentationLevel = indentationLevel
+        self.keyEquivalent = keyEquivalent
+        self.keyEquivalentModifierMask = keyEquivalentModifierMask
+        self.systemImageName = systemImageName
+        self.style = style
+        self.children = children
     }
 }
 
@@ -1551,6 +1642,8 @@ private enum ContentToBrowserMessageKind: UInt16 {
     case setPasteboardDropBehaviorHitTest = 2024
     case releaseDroppedFileAccess = 2026
     case filePromiseWriteResponse = 2027
+    case navigate = 2028
+    case openNewTab = 2029
 
     // Assign new indices in contiguous blocks to make the switch statement more efficient
 }
@@ -1573,6 +1666,92 @@ private func makeContentToBrowserFrame(type: ContentToBrowserMessageKind, payloa
     frame.append(uint16: type.rawValue)
     frame.append(payload)
     return frame
+}
+
+private func appendContextMenuItem(_ item: OuterframeContextMenuItem,
+                                   to payload: inout OffsetPayloadBuilder) throws {
+    payload.append(uint8: item.kind.rawValue)
+    payload.append(uint8: item.action.rawValue)
+    payload.append(uint8: item.isEnabled ? 1 : 0)
+    payload.append(uint8: item.state.rawValue)
+    payload.append(uint16: item.indentationLevel)
+    payload.append(uint16: UInt16(min(item.children.count, Int(UInt16.max))))
+    payload.append(uint32: item.keyEquivalentModifierMask)
+    payload.append(float32: item.style.height)
+    payload.append(float32: item.style.topInset)
+    payload.append(float32: item.style.leftInset)
+    payload.append(float32: item.style.bottomInset)
+    payload.append(float32: item.style.rightInset)
+    payload.append(float32: item.style.fontSize)
+    payload.append(float32: item.style.fontWeight)
+    payload.append(uint32: item.style.textColorRGBA)
+    payload.append(uint8: item.style.alignment.rawValue)
+    payload.append(uint8: 0)
+    payload.append(uint8: 0)
+    payload.append(uint8: 0)
+    try payload.append(stringReference: item.id)
+    try payload.append(stringReference: item.title)
+    try payload.append(stringReference: item.keyEquivalent)
+    try payload.append(stringReference: item.systemImageName)
+    for child in item.children.prefix(Int(UInt16.max)) {
+        try appendContextMenuItem(child, to: &payload)
+    }
+}
+
+private func readContextMenuItem(from cursor: inout DataCursor) throws -> OuterframeContextMenuItem {
+    guard let kindRawValue = cursor.readUInt8(),
+          let actionRawValue = cursor.readUInt8(),
+          let enabledRawValue = cursor.readUInt8(),
+          let stateRawValue = cursor.readUInt8(),
+          let indentationLevel = cursor.readUInt16(),
+          let childCount = cursor.readUInt16(),
+          let keyEquivalentModifierMask = cursor.readUInt32(),
+          let height = cursor.readFloat32(),
+          let topInset = cursor.readFloat32(),
+          let leftInset = cursor.readFloat32(),
+          let bottomInset = cursor.readFloat32(),
+          let rightInset = cursor.readFloat32(),
+          let fontSize = cursor.readFloat32(),
+          let fontWeight = cursor.readFloat32(),
+          let textColorRGBA = cursor.readUInt32(),
+          let alignmentRawValue = cursor.readUInt8(),
+          cursor.readUInt8() != nil,
+          cursor.readUInt8() != nil,
+          cursor.readUInt8() != nil,
+          let id = cursor.readStringReference(),
+          let title = cursor.readStringReference(),
+          let keyEquivalent = cursor.readStringReference(),
+          let systemImageName = cursor.readStringReference() else {
+        throw OuterframeContentSocketMessageError.truncatedPayload
+    }
+
+    var children: [OuterframeContextMenuItem] = []
+    children.reserveCapacity(Int(childCount))
+    for _ in 0..<childCount {
+        children.append(try readContextMenuItem(from: &cursor))
+    }
+
+    let style = OuterframeContextMenuItemStyle(height: height,
+                                               topInset: topInset,
+                                               leftInset: leftInset,
+                                               bottomInset: bottomInset,
+                                               rightInset: rightInset,
+                                               fontSize: fontSize,
+                                               fontWeight: fontWeight,
+                                               textColorRGBA: textColorRGBA,
+                                               alignment: OuterframeContextMenuTextAlignment(rawValue: alignmentRawValue) ?? .natural)
+    return OuterframeContextMenuItem(id: id,
+                                     title: title,
+                                     kind: OuterframeContextMenuItemKind(rawValue: kindRawValue) ?? .command,
+                                     action: OuterframeContextMenuItemAction(rawValue: actionRawValue) ?? .contentCommand,
+                                     isEnabled: enabledRawValue != 0,
+                                     state: OuterframeContextMenuItemState(rawValue: stateRawValue) ?? .off,
+                                     indentationLevel: indentationLevel,
+                                     keyEquivalent: keyEquivalent,
+                                     keyEquivalentModifierMask: keyEquivalentModifierMask,
+                                     systemImageName: systemImageName,
+                                     style: style,
+                                     children: children)
 }
 
 private func appendPasteboardItems<S: Sequence>(_ items: S,
@@ -1611,10 +1790,15 @@ private func appendDraggingItems(_ items: [OuterframeContentDraggingItem],
             try payload.append(dataReference: representation.data)
         }
         let hasPreview = item.previewImageData != nil
-        payload.append(uint8: hasPreview ? 1 << 0 : 0)
+        let hasPreviewFrameOrigin = item.previewFrameOrigin != nil
+        payload.append(uint8: (hasPreview ? 1 << 0 : 0) | (hasPreviewFrameOrigin ? 1 << 1 : 0))
         try payload.append(dataReference: item.previewImageData ?? Data())
         payload.append(float64: item.previewSize.map { Double($0.width) } ?? 0)
         payload.append(float64: item.previewSize.map { Double($0.height) } ?? 0)
+        if let previewFrameOrigin = item.previewFrameOrigin {
+            payload.append(float64: Double(previewFrameOrigin.x))
+            payload.append(float64: Double(previewFrameOrigin.y))
+        }
     }
 }
 
@@ -1676,16 +1860,28 @@ private func readDraggingItems(cursor: inout DataCursor) throws -> [OuterframeCo
             throw OuterframeContentSocketMessageError.truncatedPayload
         }
         let hasPreview = flags & (1 << 0) != 0
+        let hasPreviewFrameOrigin = flags & (1 << 1) != 0
         let previewSize: CGSize?
         if hasPreview, previewWidth > 0, previewHeight > 0 {
             previewSize = CGSize(width: previewWidth, height: previewHeight)
         } else {
             previewSize = nil
         }
+        let previewFrameOrigin: CGPoint?
+        if hasPreviewFrameOrigin {
+            guard let previewFrameOriginX = cursor.readFloat64(),
+                  let previewFrameOriginY = cursor.readFloat64() else {
+                throw OuterframeContentSocketMessageError.truncatedPayload
+            }
+            previewFrameOrigin = CGPoint(x: previewFrameOriginX, y: previewFrameOriginY)
+        } else {
+            previewFrameOrigin = nil
+        }
         items.append(OuterframeContentDraggingItem(
             pasteboardItem: OuterframeContentPasteboardItem(representations: representations),
             previewImageData: hasPreview ? previewImageData : nil,
-            previewSize: previewSize
+            previewSize: previewSize,
+            previewFrameOrigin: previewFrameOrigin
         ))
     }
     return items

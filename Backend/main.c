@@ -21,6 +21,7 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -179,12 +180,6 @@ typedef struct {
 } EventStore;
 
 typedef enum {
-    CAPTURE_MODE_AUTO,
-    CAPTURE_MODE_PROC,
-    CAPTURE_MODE_EBPF
-} CaptureMode;
-
-typedef enum {
     CAPTURE_PAUSE_REASON_NONE = 0,
     CAPTURE_PAUSE_REASON_USER = 1,
     CAPTURE_PAUSE_REASON_LOW_STORAGE = 2
@@ -199,8 +194,10 @@ typedef struct {
 } StorageStatus;
 
 static EventStore g_events = {0};
+#ifndef __linux__
 static ProcessSnapshot g_previous_snapshot = {0};
 static bool g_has_previous_snapshot = false;
+#endif
 static FdPathTable g_fd_paths = {0};
 static PendingOpenTable g_pending_opens = {0};
 static ProcessParentTable g_process_parents = {0};
@@ -224,19 +221,19 @@ static double current_time_seconds(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 }
 
-static int compare_process_info(const void *lhs, const void *rhs) {
+static TRACE_UNUSED int compare_process_info(const void *lhs, const void *rhs) {
     const ProcessInfo *a = (const ProcessInfo *)lhs;
     const ProcessInfo *b = (const ProcessInfo *)rhs;
     return (a->pid > b->pid) - (a->pid < b->pid);
 }
 
-static void free_process_snapshot(ProcessSnapshot *snapshot) {
+static TRACE_UNUSED void free_process_snapshot(ProcessSnapshot *snapshot) {
     free(snapshot->items);
     snapshot->items = NULL;
     snapshot->count = 0;
 }
 
-static bool append_process(ProcessSnapshot *snapshot, ProcessInfo process) {
+static TRACE_UNUSED bool append_process(ProcessSnapshot *snapshot, ProcessInfo process) {
     ProcessInfo *next = realloc(snapshot->items, sizeof(ProcessInfo) * (snapshot->count + 1));
     if (!next) {
         return false;
@@ -509,45 +506,6 @@ static TRACE_UNUSED int normalize_process_parent_pid(int ppid) {
     return ppid;
 }
 #else
-static bool read_linux_process_stat(int pid, ProcessInfo *info) {
-    char path[PATH_MAX];
-    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
-
-    FILE *file = fopen(path, "r");
-    if (!file) {
-        return false;
-    }
-    char line[4096];
-    bool ok = fgets(line, sizeof(line), file) != NULL;
-    fclose(file);
-    if (!ok) {
-        return false;
-    }
-
-    char *open = strchr(line, '(');
-    char *close = strrchr(line, ')');
-    if (!open || !close || close <= open) {
-        return false;
-    }
-
-    size_t name_len = (size_t)(close - open - 1);
-    if (name_len >= sizeof(info->name)) {
-        name_len = sizeof(info->name) - 1;
-    }
-    memcpy(info->name, open + 1, name_len);
-    info->name[name_len] = '\0';
-
-    char state = '\0';
-    int ppid = 0;
-    if (sscanf(close + 2, "%c %d", &state, &ppid) != 2) {
-        return false;
-    }
-    (void)state;
-    info->pid = pid;
-    info->ppid = ppid;
-    return true;
-}
-
 static bool read_linux_process_tgid(int pid, int *tgid_out) {
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "/proc/%d/status", pid);
@@ -587,31 +545,48 @@ static TRACE_UNUSED int normalize_process_parent_pid(int ppid) {
     return read_linux_process_tgid(ppid, &tgid) ? tgid : ppid;
 }
 
-static bool capture_process_snapshot(ProcessSnapshot *snapshot) {
-    DIR *dir = opendir("/proc");
-    if (!dir) {
+static bool read_linux_cmdline_process_name(int pid, char *out, size_t out_size) {
+    if (pid <= 0 || !out || out_size == 0) {
+        return false;
+    }
+    out[0] = '\0';
+
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
+    FILE *file = fopen(path, "r");
+    if (!file) {
         return false;
     }
 
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (!isdigit((unsigned char)entry->d_name[0])) {
-            continue;
-        }
-        char *end = NULL;
-        long pid_long = strtol(entry->d_name, &end, 10);
-        if (!end || *end != '\0' || pid_long <= 0 || pid_long > INT_MAX) {
-            continue;
-        }
-
-        ProcessInfo info = {0};
-        if (read_linux_process_stat((int)pid_long, &info)) {
-            append_process(snapshot, info);
-        }
+    char buffer[512];
+    size_t length = fread(buffer, 1, sizeof(buffer) - 1, file);
+    fclose(file);
+    if (length == 0) {
+        return false;
     }
-    closedir(dir);
-    qsort(snapshot->items, snapshot->count, sizeof(ProcessInfo), compare_process_info);
-    return true;
+
+    char *first_separator = memchr(buffer, '\0', length);
+    if (first_separator) {
+        *first_separator = '\0';
+    } else {
+        buffer[length] = '\0';
+    }
+    if (buffer[0] == '\0') {
+        return false;
+    }
+
+    const char *base = buffer;
+    char *slash = strrchr(buffer, '/');
+    if (slash && slash[1] != '\0') {
+        base = slash + 1;
+    }
+    size_t base_length = strnlen(base, sizeof(buffer));
+    if (base_length >= out_size) {
+        base_length = out_size - 1;
+    }
+    memcpy(out, base, base_length);
+    out[base_length] = '\0';
+    return out[0] != '\0';
 }
 #endif
 
@@ -1128,6 +1103,13 @@ static void consume_perf_ring(PerfRing *ring) {
                     .ppid = bpf_event.ppid
                 };
                 snprintf(process.name, sizeof(process.name), "%.*s", (int)sizeof(bpf_event.comm), bpf_event.comm);
+                if (strlen(process.name) == 15) {
+                    char cmdline_name[sizeof(process.name)];
+                    if (read_linux_cmdline_process_name(process.pid, cmdline_name, sizeof(cmdline_name))) {
+                        memcpy(process.name, cmdline_name, sizeof(process.name));
+                        process.name[sizeof(process.name) - 1] = '\0';
+                    }
+                }
                 if (process.name[0] == '\0') {
                     snprintf(process.name, sizeof(process.name), "pid-%d", process.pid);
                 }
@@ -1440,13 +1422,13 @@ typedef struct {
 
 static EBPFCapture g_ebpf_capture = {0};
 
-static bool start_ebpf_capture(EBPFCapture *capture, char *error, size_t error_size) {
+static TRACE_UNUSED bool start_ebpf_capture(EBPFCapture *capture, char *error, size_t error_size) {
     (void)capture;
     snprintf(error, error_size, "eBPF capture is only available on Linux");
     return false;
 }
 
-static void consume_ebpf_events(EBPFCapture *capture) {
+static TRACE_UNUSED void consume_ebpf_events(EBPFCapture *capture) {
     (void)capture;
 }
 
@@ -1647,6 +1629,7 @@ static void add_event(const char *type, const ProcessInfo *process, const char *
     }
 }
 
+#ifndef __linux__
 static void update_process_events(void) {
     ProcessSnapshot current = {0};
     if (!capture_process_snapshot(&current)) {
@@ -1722,6 +1705,7 @@ static bool refresh_process_baseline(void) {
     g_has_previous_snapshot = true;
     return true;
 }
+#endif
 
 static void format_bytes_compact(uint64_t bytes, char *buffer, size_t buffer_size) {
     const char *units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
@@ -1761,9 +1745,12 @@ static void set_capture_paused_internal(bool paused,
     if (g_capture_uses_ebpf) {
         discard_ebpf_ring_backlog(&g_ebpf_capture);
         set_ebpf_capture_enabled(&g_ebpf_capture, true);
-    } else {
+    }
+#ifndef __linux__
+    else {
         refresh_process_baseline();
     }
+#endif
     g_capture_paused = false;
     g_capture_pause_reason = CAPTURE_PAUSE_REASON_NONE;
     add_event("capture.resume", &self, "", "Resumed event capture");
@@ -1825,7 +1812,9 @@ static bool clear_capture_log(void) {
         return false;
     }
     if (!g_capture_uses_ebpf) {
+#ifndef __linux__
         refresh_process_baseline();
+#endif
     }
     return true;
 }
@@ -3125,6 +3114,83 @@ static int create_listener(int port) {
     return fd;
 }
 
+static int systemd_inherited_listener(void) {
+    const char *listen_pid = getenv("LISTEN_PID");
+    const char *listen_fds = getenv("LISTEN_FDS");
+    if (!listen_pid || !listen_fds) {
+        return -1;
+    }
+
+    char *end = NULL;
+    errno = 0;
+    long pid = strtol(listen_pid, &end, 10);
+    if (errno != 0 || !end || *end != '\0' || pid != (long)getpid()) {
+        return -1;
+    }
+
+    end = NULL;
+    errno = 0;
+    long fds = strtol(listen_fds, &end, 10);
+    if (errno != 0 || !end || *end != '\0' || fds < 1) {
+        return -1;
+    }
+
+    int fd = 3;
+    if (fcntl(fd, F_GETFD) < 0) {
+        return -1;
+    }
+    return fd;
+}
+
+static int create_unix_listener(const char *socket_path, bool *should_unlink_socket) {
+    if (should_unlink_socket) {
+        *should_unlink_socket = false;
+    }
+
+    int inherited_fd = systemd_inherited_listener();
+    if (inherited_fd >= 0) {
+        return inherited_fd;
+    }
+
+    if (!socket_path || !socket_path[0]) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (strlen(socket_path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        perror("socket");
+        return -1;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path);
+
+    unlink(socket_path);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        perror("bind");
+        close(fd);
+        return -1;
+    }
+    if (listen(fd, 64) != 0) {
+        perror("listen");
+        close(fd);
+        unlink(socket_path);
+        return -1;
+    }
+
+    if (should_unlink_socket) {
+        *should_unlink_socket = true;
+    }
+    return fd;
+}
+
 static bool parse_port(const char *value, int *port_out) {
     char *end = NULL;
     errno = 0;
@@ -3136,24 +3202,8 @@ static bool parse_port(const char *value, int *port_out) {
     return true;
 }
 
-static bool parse_capture_mode(const char *value, CaptureMode *mode_out) {
-    if (strcmp(value, "auto") == 0) {
-        *mode_out = CAPTURE_MODE_AUTO;
-        return true;
-    }
-    if (strcmp(value, "proc") == 0) {
-        *mode_out = CAPTURE_MODE_PROC;
-        return true;
-    }
-    if (strcmp(value, "ebpf") == 0) {
-        *mode_out = CAPTURE_MODE_EBPF;
-        return true;
-    }
-    return false;
-}
-
 static void print_usage(const char *program) {
-    fprintf(stderr, "Usage: %s [--port PORT] [--bundles-dir DIR] [--capture auto|proc|ebpf]\n", program);
+    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--bundles-dir DIR] [--capture ebpf]\n", program);
 }
 
 int main(int argc, char **argv) {
@@ -3166,13 +3216,18 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &action, NULL);
 
     int port = DEFAULT_PORT;
-    CaptureMode capture_mode = CAPTURE_MODE_AUTO;
+    const char *socket_path = NULL;
+    const char *label = "TraceBackend";
+    const char *icon_file = NULL;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             if (!parse_port(argv[++i], &port)) {
                 print_usage(argv[0]);
                 return 2;
             }
+            socket_path = NULL;
+        } else if (strcmp(argv[i], "--socket-path") == 0 && i + 1 < argc) {
+            socket_path = argv[++i];
         } else if (strcmp(argv[i], "--bundles-dir") == 0 && i + 1 < argc) {
             const char *dir = argv[++i];
             snprintf(g_bundle_file_path_macos_arm, sizeof(g_bundle_file_path_macos_arm),
@@ -3180,10 +3235,15 @@ int main(int argc, char **argv) {
             snprintf(g_bundle_file_path_macos_x86, sizeof(g_bundle_file_path_macos_x86),
                      "%s/TraceContent.bundle.macos-x86.aar", dir);
         } else if (strcmp(argv[i], "--capture") == 0 && i + 1 < argc) {
-            if (!parse_capture_mode(argv[++i], &capture_mode)) {
+            const char *capture_mode = argv[++i];
+            if (strcmp(capture_mode, "ebpf") != 0) {
                 print_usage(argv[0]);
                 return 2;
             }
+        } else if (strcmp(argv[i], "--label") == 0 && i + 1 < argc) {
+            label = argv[++i];
+        } else if (strcmp(argv[i], "--icon-file") == 0 && i + 1 < argc) {
+            icon_file = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -3193,45 +3253,48 @@ int main(int argc, char **argv) {
         }
     }
 
+#ifdef __linux__
+    if (geteuid() != 0) {
+        fprintf(stderr, "TraceBackend requires root privileges for eBPF capture. Install Firehose as a root backend or run it with sudo.\n");
+        return 1;
+    }
+#endif
+
     if (!event_store_init(&g_events)) {
         perror("event store");
         return 1;
     }
 
+#ifdef __linux__
     bool using_ebpf = false;
-    if (capture_mode != CAPTURE_MODE_PROC) {
-        char ebpf_error[1024];
-        ebpf_error[0] = '\0';
-        using_ebpf = start_ebpf_capture(&g_ebpf_capture, ebpf_error, sizeof(ebpf_error));
-        if (!using_ebpf) {
-            if (capture_mode == CAPTURE_MODE_EBPF) {
-                fprintf(stderr, "TraceBackend eBPF capture failed: %s\n", ebpf_error);
-                stop_ebpf_capture(&g_ebpf_capture);
-                event_store_close(&g_events);
-                fd_path_table_free(&g_fd_paths);
-                pending_open_table_free(&g_pending_opens);
-                process_parent_table_free(&g_process_parents);
-                return 1;
-            }
-            ProcessInfo self = {.pid = 0, .ppid = 0};
-            snprintf(self.name, sizeof(self.name), "trace");
-            char detail[512];
-            snprintf(detail, sizeof(detail), "eBPF unavailable, using /proc polling: %s", ebpf_error);
-            add_event("capture.warning", &self, "", detail);
-        }
+    char ebpf_error[1024];
+    ebpf_error[0] = '\0';
+    using_ebpf = start_ebpf_capture(&g_ebpf_capture, ebpf_error, sizeof(ebpf_error));
+    if (!using_ebpf) {
+        fprintf(stderr, "TraceBackend eBPF capture failed: %s\n", ebpf_error);
+        stop_ebpf_capture(&g_ebpf_capture);
+        event_store_close(&g_events);
+        fd_path_table_free(&g_fd_paths);
+        pending_open_table_free(&g_pending_opens);
+        process_parent_table_free(&g_process_parents);
+        return 1;
     }
 
-    if (using_ebpf) {
-        g_capture_uses_ebpf = true;
-        ProcessInfo self = {.pid = 0, .ppid = 0};
-        snprintf(self.name, sizeof(self.name), "trace");
-        add_event("capture.start", &self, "", "Started eBPF process capture on sched_process_fork and sched_process_exit");
-    } else {
-        g_capture_uses_ebpf = false;
-        update_process_events();
-    }
+    g_capture_uses_ebpf = true;
+    ProcessInfo self = {.pid = 0, .ppid = 0};
+    snprintf(self.name, sizeof(self.name), "trace");
+    add_event("capture.start", &self, "", "Started eBPF process capture on sched_process_fork and sched_process_exit");
+#else
+    bool using_ebpf = false;
+    g_capture_uses_ebpf = false;
+    update_process_events();
+#endif
 
-    int listen_fd = create_listener(port);
+    (void)icon_file;
+    bool should_unlink_socket = false;
+    int listen_fd = socket_path
+        ? create_unix_listener(socket_path, &should_unlink_socket)
+        : create_listener(port);
     if (listen_fd < 0) {
         stop_ebpf_capture(&g_ebpf_capture);
         event_store_close(&g_events);
@@ -3241,8 +3304,13 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    printf("TraceBackend listening on http://127.0.0.1:%d/ (%s capture)\n",
-           port, using_ebpf ? "eBPF" : "proc");
+    if (socket_path) {
+        printf("%s listening on %s/ (%s capture)\n",
+               label, socket_path, using_ebpf ? "eBPF" : "process table");
+    } else {
+        printf("%s listening on http://127.0.0.1:%d/ (%s capture)\n",
+               label, port, using_ebpf ? "eBPF" : "process table");
+    }
     fflush(stdout);
 
     struct pollfd pfd = {.fd = listen_fd, .events = POLLIN, .revents = 0};
@@ -3262,17 +3330,22 @@ int main(int argc, char **argv) {
         if (g_capture_paused) {
             continue;
         }
-        if (using_ebpf) {
-            consume_ebpf_events(&g_ebpf_capture);
-        } else {
-            update_process_events();
-        }
+#ifdef __linux__
+        consume_ebpf_events(&g_ebpf_capture);
+#else
+        update_process_events();
+#endif
     }
 
     close(listen_fd);
+    if (should_unlink_socket && socket_path) {
+        unlink(socket_path);
+    }
     stop_ebpf_capture(&g_ebpf_capture);
     event_store_close(&g_events);
+#ifndef __linux__
     free_process_snapshot(&g_previous_snapshot);
+#endif
     fd_path_table_free(&g_fd_paths);
     pending_open_table_free(&g_pending_opens);
     process_parent_table_free(&g_process_parents);

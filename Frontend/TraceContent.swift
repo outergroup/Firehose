@@ -1768,8 +1768,8 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                                                        title: "Exclude \(filterHit.column.title) is \"\(value)\""))
             menuItems.append(OuterframeContextMenuItem(id: "copy-separator",
                                                        title: "",
-                                                       isEnabled: false,
-                                                       isSeparator: true))
+                                                       kind: .separator,
+                                                       isEnabled: false))
         }
         menuItems.append(OuterframeContextMenuItem(id: "copy",
                                                    title: "Copy",
@@ -1818,8 +1818,8 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                                                            action: .standardLookUp))
                 menuItems.append(OuterframeContextMenuItem(id: "lookup-separator",
                                                            title: "",
-                                                           isEnabled: false,
-                                                           isSeparator: true))
+                                                           kind: .separator,
+                                                           isEnabled: false))
             }
             menuItems.append(OuterframeContextMenuItem(id: "cut",
                                                        title: "Cut",
@@ -1839,16 +1839,16 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             if !selectedText.isEmpty {
                 menuItems.append(OuterframeContextMenuItem(id: "services-separator",
                                                            title: "",
-                                                           isEnabled: false,
-                                                           isSeparator: true))
+                                                           kind: .separator,
+                                                           isEnabled: false))
                 menuItems.append(OuterframeContextMenuItem(id: "services",
                                                            title: "Services",
                                                            action: .standardServices))
             }
             menuItems.append(OuterframeContextMenuItem(id: "paste-programmatic-separator",
                                                        title: "",
-                                                       isEnabled: false,
-                                                       isSeparator: true))
+                                                       kind: .separator,
+                                                       isEnabled: false))
             menuItems.append(OuterframeContextMenuItem(id: "paste-programmatic",
                                                        title: "Paste (programmatic)"))
             let menuID = UUID()
