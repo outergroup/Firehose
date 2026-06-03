@@ -149,6 +149,7 @@ private struct TimelineProcess {
     let eventCount: UInt64
     let openAtStart: Bool
     let isRunning: Bool
+    let level: Int
 }
 
 private struct TimelineProcessRow {
@@ -378,7 +379,7 @@ private func decodeProcessTimelineResponse(_ data: Data) throws -> ProcessTimeli
     let dotMaxCount = headerSize >= 64 ? Int(try data.traceUInt32(at: 60)) : 0
 
     guard magic == 0x5043_5254,
-          version == 1 || version == 2 || version == 3 || version == 4,
+          version == 1 || version == 2 || version == 3 || version == 4 || version == 5,
           headerSize >= 48,
           recordSize >= 64,
           totalProcessCountValue <= UInt64(Int.max),
@@ -433,7 +434,8 @@ private func decodeProcessTimelineResponse(_ data: Data) throws -> ProcessTimeli
                                          lastTimestamp: try data.traceDouble(at: offset + 32),
                                          eventCount: try data.traceUInt64(at: offset + 40),
                                          openAtStart: (flags & 1) != 0,
-                                         isRunning: (flags & 2) != 0))
+                                         isRunning: (flags & 2) != 0,
+                                         level: version >= 5 ? Int(try data.traceUInt16(at: offset + 60)) : 0))
     }
 
     return ProcessTimelineResponse(captureStart: captureStart,
@@ -611,7 +613,13 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     private var lastProcessTimelineRequestedEventCount: UInt64 = 0
     private var lastProcessTimelineRequestedFilterKey = ""
     private var inFlightProcessTimelineFilterKey = ""
+    private var lastProcessTimelineRequestedStart = -1
+    private var lastProcessTimelineRequestedCount = -1
+    private var inFlightProcessTimelineStart = 0
+    private var processTimelineHasLoaded = false
     private var processTimelineResponse: ProcessTimelineResponse?
+    private var processTimelineTotalRows = 0
+    private var processTimelinePageStart = 0
     private var processTimelineRows: [TimelineProcessRow] = []
     private var processTimelineDotsByPID: [Int: [TimelineEventDot]] = [:]
     private var hoveredProcessTimelineDot: TimelineEventDotHit?
@@ -637,6 +645,9 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     private let renderedRowOverscan: Int = 8
     private let maxPrefetchRows = 512
     private let minPrefetchRows = 120
+    private let processTimelineRenderedRowOverscan = 8
+    private let processTimelineMinPrefetchRows = 48
+    private let processTimelineMaxPrefetchRows = 160
     private let filterPillSize = CGSize(width: 260, height: 28)
     private let pauseButtonSize = CGSize(width: 28, height: 28)
     private let clearLogButtonSize = CGSize(width: 28, height: 28)
@@ -692,6 +703,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             clampProcessTimelineScrollOffset()
             updateLayout()
             fetchVisibleWindow(force: true)
+            fetchProcessTimeline(force: false)
 
         case .systemAppearanceUpdate(let appearance):
             self.appearance = appearance
@@ -704,6 +716,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                 clampProcessTimelineScrollOffset()
                 updateLayout()
                 updateHoveredProcessTimelineDot(at: point)
+                fetchProcessTimeline(force: false)
                 return
             }
             guard rowsClipLayer.frame.contains(tableLayer.convert(point, from: rootLayer)) else { return }
@@ -1245,16 +1258,16 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         let startTime = processTimelineResponse?.captureStart ?? 0
         let endTime = max(processTimelineResponse?.captureEnd ?? startTime, startTime + 0.001)
         let duration = max(endTime - startTime, 0.001)
-        let visibleTimelineRowCount = min(timelineRowLayers.count, max(processTimelineRows.count - visibleStart, 0))
+        let visibleTimelineRowCount = min(timelineRowLayers.count, max(processTimelineTotalRows - visibleStart, 0))
 
         for (layerIndex, row) in timelineRowLayers.enumerated() {
             let processIndex = visibleStart + layerIndex
-            guard processIndex < processTimelineRows.count else {
+            guard processIndex < processTimelineTotalRows,
+                  let item = processTimelineRow(forGlobalIndex: processIndex) else {
                 row.container.isHidden = true
                 continue
             }
 
-            let item = processTimelineRows[processIndex]
             let process = item.process
             let y = processTimelineRowsClipLayer.bounds.height - CGFloat(layerIndex + 1) * processTimelineRowHeight
             row.container.isHidden = false
@@ -1302,7 +1315,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                                 visibleRowCount: visibleTimelineRowCount)
         layoutHoveredProcessTimelineDot()
 
-        processTimelineEmptyLayer.isHidden = !processTimelineRows.isEmpty
+        processTimelineEmptyLayer.isHidden = processTimelineTotalRows > 0 || processTimelineInFlight || !processTimelineHasLoaded
         processTimelineEmptyLayer.frame = processTimelineRowsClipLayer.bounds.insetBy(dx: 16, dy: max(processTimelineRowsClipLayer.bounds.height / 2 - 10, 0))
     }
 
@@ -1335,8 +1348,8 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         visibleRowByPID.reserveCapacity(visibleRowCount)
         for layerIndex in 0..<visibleRowCount {
             let processIndex = visibleStart + layerIndex
-            guard processIndex >= 0 && processIndex < processTimelineRows.count else { continue }
-            visibleRowByPID[processTimelineRows[processIndex].process.pid] = layerIndex
+            guard let item = processTimelineRow(forGlobalIndex: processIndex) else { continue }
+            visibleRowByPID[item.process.pid] = layerIndex
         }
 
         for dot in response.eventDots where dot.count > 0 {
@@ -1382,7 +1395,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         }
 
         let visibleStart = processTimelineVisibleStartIndex()
-        let visibleCount = min(timelineRowLayers.count, max(processTimelineRows.count - visibleStart, 0))
+        let visibleCount = min(timelineRowLayers.count, max(processTimelineTotalRows - visibleStart, 0))
         guard visibleCount > 0 else { return nil }
 
         let startTime = response.captureStart
@@ -1395,8 +1408,8 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
 
         for layerIndex in 0..<visibleCount {
             let processIndex = visibleStart + layerIndex
-            guard processIndex >= 0 && processIndex < processTimelineRows.count else { continue }
-            let pid = processTimelineRows[processIndex].process.pid
+            guard let item = processTimelineRow(forGlobalIndex: processIndex) else { continue }
+            let pid = item.process.pid
             guard let dots = processTimelineDotsByPID[pid] else { continue }
             let rowCenterY = processTimelineRowsClipLayer.bounds.height -
                 CGFloat(layerIndex + 1) * processTimelineRowHeight +
@@ -1437,15 +1450,15 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         let timelineWidth = max(processTimelineRowsClipLayer.bounds.width - processTimelineNameWidth - processTimelinePIDWidth - processTimelineEventsWidth - 24, 24)
         let timelineX = processTimelineNameWidth + processTimelinePIDWidth + processTimelineEventsWidth + 18
         let visibleStart = processTimelineVisibleStartIndex()
-        let visibleCount = min(timelineRowLayers.count, max(processTimelineRows.count - visibleStart, 0))
+        let visibleCount = min(timelineRowLayers.count, max(processTimelineTotalRows - visibleStart, 0))
         let startTime = response.captureStart
         let endTime = max(response.captureEnd, startTime + 0.001)
         let duration = max(endTime - startTime, 0.001)
 
         for layerIndex in 0..<visibleCount {
             let processIndex = visibleStart + layerIndex
-            guard processIndex >= 0 && processIndex < processTimelineRows.count else { continue }
-            guard processTimelineRows[processIndex].process.pid == pid else { continue }
+            guard let item = processTimelineRow(forGlobalIndex: processIndex),
+                  item.process.pid == pid else { continue }
 
             let normalized = CGFloat((timestamp - startTime) / duration)
             let rowCenterY = processTimelineRowsClipLayer.bounds.height -
@@ -1504,7 +1517,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     private func layoutProcessTimelineScrollbar() {
         let viewportHeight = processTimelineRowsClipLayer.bounds.height
         let trackHeight = processTimelineScrollbarTrackLayer.bounds.height
-        let contentHeight = CGFloat(processTimelineRows.count) * processTimelineRowHeight
+        let contentHeight = CGFloat(processTimelineTotalRows) * processTimelineRowHeight
         let maxOffset = max(contentHeight - viewportHeight, 0)
         processTimelineScrollbarTrackLayer.isHidden = maxOffset <= 0
         if maxOffset <= 0 {
@@ -1623,11 +1636,14 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
 
         let rowFromTop = Int(floor((processTimelineRowsClipLayer.bounds.height - timelinePoint.y) / processTimelineRowHeight))
         let processIndex = processTimelineVisibleStartIndex() + max(rowFromTop, 0)
-        guard processIndex >= 0, processIndex < processTimelineRows.count else {
+        guard processIndex >= 0,
+              processIndex < processTimelineTotalRows,
+              let row = processTimelineRow(forGlobalIndex: processIndex) else {
+            fetchProcessTimeline(force: false)
             return true
         }
 
-        jumpToEvent(for: processTimelineRows[processIndex].process.pid)
+        jumpToEvent(for: row.process.pid)
         return true
     }
 
@@ -1683,6 +1699,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         processTimelineScrollOffset = normalizedFromTop * maxProcessTimelineScrollOffset()
         clampProcessTimelineScrollOffset()
         updateLayout()
+        fetchProcessTimeline(force: false)
     }
 
     private func handleFilterMouseDown(at point: CGPoint,
@@ -2127,12 +2144,23 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
 
     private func applyFilterChange() {
         scrollOffset = 0
+        processTimelineScrollOffset = 0
         resetScrollPrediction()
         lastRequestedStart = -1
         lastRequestedCount = -1
         lastRequestedTail = false
         lastRequestedFilterKey = ""
         lastProcessTimelineRequestedFilterKey = ""
+        lastProcessTimelineRequestedStart = -1
+        lastProcessTimelineRequestedCount = -1
+        processTimelineResponse = nil
+        processTimelineHasLoaded = false
+        processTimelineTotalRows = 0
+        processTimelinePageStart = 0
+        processTimelineRows = []
+        processTimelineDotsByPID = [:]
+        hoveredProcessTimelineDot = nil
+        processTimelineHoveredDotLayer.path = nil
         updateFilterText()
         updateLayout()
         updateTextInputState()
@@ -2259,13 +2287,19 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         lastRequestedFilterKey = ""
         inFlightFilterKey = ""
         processTimelineResponse = nil
+        processTimelineHasLoaded = false
+        processTimelineTotalRows = 0
+        processTimelinePageStart = 0
         processTimelineRows = []
         processTimelineDotsByPID = [:]
         processTimelineInFlight = false
         pendingProcessTimelineFetchAfterInFlight = false
         lastProcessTimelineRequestedEventCount = 0
         lastProcessTimelineRequestedFilterKey = ""
+        lastProcessTimelineRequestedStart = -1
+        lastProcessTimelineRequestedCount = -1
         inFlightProcessTimelineFilterKey = ""
+        inFlightProcessTimelineStart = 0
         hoveredProcessTimelineDot = nil
         processTimelineHoveredDotLayer.path = nil
         processTimelineScrollOffset = 0
@@ -2602,17 +2636,74 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
 
     private func updateTimelineRowLayerCount() {
         let visibleRows = max(Int(ceil(processTimelineRowsClipLayer.bounds.height / processTimelineRowHeight)), 1)
-        let needed = min(max(visibleRows + 1, 1), max(processTimelineRows.count, 1))
+        let needed = min(max(visibleRows + 1, 1), max(processTimelineTotalRows, 1))
         while timelineRowLayers.count < needed {
             timelineRowLayers.append(makeTimelineRowLayers())
         }
         for (index, row) in timelineRowLayers.enumerated() {
-            row.container.isHidden = index >= needed || processTimelineRows.isEmpty
+            row.container.isHidden = index >= needed || processTimelineTotalRows == 0
         }
     }
 
     private func processTimelineVisibleStartIndex() -> Int {
-        max(Int(floor(processTimelineScrollOffset / processTimelineRowHeight)), 0)
+        min(max(Int(floor(processTimelineScrollOffset / processTimelineRowHeight)), 0),
+            max(processTimelineTotalRows - 1, 0))
+    }
+
+    private func processTimelinePageIndex(forGlobalIndex index: Int) -> Int? {
+        let pageIndex = index - processTimelinePageStart
+        guard pageIndex >= 0,
+              pageIndex < processTimelineRows.count else {
+            return nil
+        }
+        return pageIndex
+    }
+
+    private func processTimelineRow(forGlobalIndex index: Int) -> TimelineProcessRow? {
+        guard let pageIndex = processTimelinePageIndex(forGlobalIndex: index) else {
+            return nil
+        }
+        return processTimelineRows[pageIndex]
+    }
+
+    private func visibleProcessTimelineRowRange() -> (start: Int, end: Int) {
+        let viewportHeight = max(processTimelineRowsClipLayer.bounds.height, processTimelineRowHeight)
+        let start = processTimelineVisibleStartIndex()
+        let end = max(Int(ceil((processTimelineScrollOffset + viewportHeight) / processTimelineRowHeight)), start + 1)
+        let boundedTotal = max(processTimelineTotalRows, end)
+        return (start, min(end, boundedTotal))
+    }
+
+    private func desiredProcessTimelineWindow() -> (start: Int, count: Int) {
+        let visible = visibleProcessTimelineRowRange()
+        let visibleCount = max(visible.end - visible.start, 1)
+        let overscan = max(processTimelineRenderedRowOverscan, visibleCount)
+        let boundedTotal = processTimelineTotalRows > 0 ?
+            max(processTimelineTotalRows, visible.end) :
+            max(processTimelineMinPrefetchRows, visible.end)
+        var start = max(visible.start - overscan, 0)
+        var end = min(max(visible.end + overscan, start + processTimelineMinPrefetchRows), boundedTotal)
+        if end - start < processTimelineMinPrefetchRows {
+            start = max(0, min(start, end - processTimelineMinPrefetchRows))
+            end = min(boundedTotal, max(end, start + processTimelineMinPrefetchRows))
+        }
+        if end - start > processTimelineMaxPrefetchRows {
+            let center = (visible.start + visible.end) / 2
+            start = max(0, center - processTimelineMaxPrefetchRows / 2)
+            end = min(boundedTotal, start + processTimelineMaxPrefetchRows)
+            start = max(0, end - processTimelineMaxPrefetchRows)
+        }
+        return (start, max(end - start, 1))
+    }
+
+    private func processTimelineResponseCoversDesiredWindow() -> Bool {
+        let desired = desiredProcessTimelineWindow()
+        let desiredEnd = min(desired.start + desired.count, max(processTimelineTotalRows, desired.start + desired.count))
+        let responseEnd = processTimelinePageStart + processTimelineRows.count
+        if processTimelineTotalRows == 0 {
+            return processTimelineHasLoaded
+        }
+        return desired.start >= processTimelinePageStart && desiredEnd <= responseEnd
     }
 
     private func visibleRowRange(for offset: CGFloat) -> (start: Int, end: Int) {
@@ -2880,13 +2971,34 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             return
         }
 
-        var components = URLComponents(url: processTimelineEndpoint, resolvingAgainstBaseURL: false)
-        components?.queryItems = activeFilterQueryItems()
-        guard let url = components?.url else { return }
+        let window = desiredProcessTimelineWindow()
+        let start = window.start
+        let count = window.count
         let filterKey = currentFilterKey()
+        if !force &&
+            filterKey == lastProcessTimelineRequestedFilterKey &&
+            start == lastProcessTimelineRequestedStart &&
+            count == lastProcessTimelineRequestedCount &&
+            processTimelineResponseCoversDesiredWindow() {
+            return
+        }
+
+        var components = URLComponents(url: processTimelineEndpoint, resolvingAgainstBaseURL: false)
+        components?.queryItems = [
+            URLQueryItem(name: "start", value: String(start)),
+            URLQueryItem(name: "count", value: String(count))
+        ]
+        var queryItems = components?.queryItems ?? []
+        queryItems.append(contentsOf: activeFilterQueryItems())
+        components?.queryItems = queryItems
+        guard let url = components?.url else { return }
         pendingProcessTimelineFetchAfterInFlight = false
         processTimelineInFlight = true
+        lastProcessTimelineRequestedStart = start
+        lastProcessTimelineRequestedCount = count
+        lastProcessTimelineRequestedFilterKey = filterKey
         inFlightProcessTimelineFilterKey = filterKey
+        inFlightProcessTimelineStart = start
         let requestGeneration = logGeneration
         urlSession.dataTask(with: url) { [weak self] data, _, error in
             let errorText = error?.localizedDescription
@@ -2903,7 +3015,8 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         guard eventCount != lastProcessTimelineRequestedEventCount ||
               filterKey != lastProcessTimelineRequestedFilterKey else { return }
         lastProcessTimelineRequestedEventCount = eventCount
-        lastProcessTimelineRequestedFilterKey = filterKey
+        lastProcessTimelineRequestedStart = -1
+        lastProcessTimelineRequestedCount = -1
         fetchProcessTimeline(force: false)
     }
 
@@ -2911,7 +3024,9 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         guard generation == logGeneration else { return }
         processTimelineInFlight = false
         let responseFilterKey = inFlightProcessTimelineFilterKey
+        let responseStart = inFlightProcessTimelineStart
         inFlightProcessTimelineFilterKey = ""
+        inFlightProcessTimelineStart = 0
         let hadPendingFetch = pendingProcessTimelineFetchAfterInFlight
         pendingProcessTimelineFetchAfterInFlight = false
         if responseFilterKey != currentFilterKey() {
@@ -2938,16 +3053,23 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         do {
             let response = try decodeProcessTimelineResponse(data)
             processTimelineResponse = response
-            processTimelineRows = orderedTimelineRows(from: response.processes)
+            processTimelineHasLoaded = true
+            processTimelineTotalRows = response.processCount
+            processTimelinePageStart = responseStart
+            processTimelineRows = response.processes.map { TimelineProcessRow(process: $0, level: $0.level) }
             processTimelineDotsByPID = Dictionary(grouping: response.eventDots, by: \.pid)
             clampProcessTimelineScrollOffset()
             updateProcessTimelineRows()
             updateLayout()
+            let shouldRefetch = !processTimelineResponseCoversDesiredWindow()
+            if shouldRefetch || hadPendingFetch {
+                fetchProcessTimeline(force: true)
+            }
         } catch {
             lastErrorText = "Could not decode process timeline response"
             updateStatusText()
         }
-        if hadPendingFetch {
+        if hadPendingFetch && !processTimelineInFlight {
             fetchProcessTimeline(force: false)
         }
     }
@@ -3027,48 +3149,6 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         fetchVisibleWindow(force: true)
     }
 
-    private func orderedTimelineRows(from processes: [TimelineProcess]) -> [TimelineProcessRow] {
-        let sorted = processes.sorted {
-            if $0.startTimestamp != $1.startTimestamp {
-                return $0.startTimestamp < $1.startTimestamp
-            }
-            return $0.pid < $1.pid
-        }
-        let byPID = Dictionary(uniqueKeysWithValues: sorted.map { ($0.pid, $0) })
-        var childrenByParent: [Int: [TimelineProcess]] = [:]
-        for process in sorted {
-            childrenByParent[process.ppid, default: []].append(process)
-        }
-        for parent in childrenByParent.keys {
-            childrenByParent[parent]?.sort {
-                if $0.startTimestamp != $1.startTimestamp {
-                    return $0.startTimestamp < $1.startTimestamp
-                }
-                return $0.pid < $1.pid
-            }
-        }
-
-        var rows: [TimelineProcessRow] = []
-        var visited = Set<Int>()
-
-        func appendSubtree(_ process: TimelineProcess, level: Int) {
-            guard !visited.contains(process.pid) else { return }
-            visited.insert(process.pid)
-            rows.append(TimelineProcessRow(process: process, level: level))
-            for child in childrenByParent[process.pid] ?? [] {
-                appendSubtree(child, level: min(level + 1, 8))
-            }
-        }
-
-        for process in sorted where process.ppid <= 0 || byPID[process.ppid] == nil {
-            appendSubtree(process, level: 0)
-        }
-        for process in sorted where !visited.contains(process.pid) {
-            appendSubtree(process, level: 0)
-        }
-        return rows
-    }
-
     private func updateRows() {
         withoutImplicitAnimations {
             updateRowLayerCount()
@@ -3103,8 +3183,8 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                 let denominator = max(unfilteredRows, totalRows)
                 let percentage = denominator > 0 ? Int((Double(shownRows) / Double(denominator) * 100).rounded()) : 0
                 let processText: String
-                if let processTimelineResponse {
-                    processText = " - \(formatCount(processTimelineResponse.processCount)) processes"
+                if processTimelineHasLoaded {
+                    processText = " - \(formatCount(processTimelineTotalRows)) processes"
                 } else {
                     processText = ""
                 }
@@ -3140,7 +3220,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     }
 
     private func maxProcessTimelineScrollOffset() -> CGFloat {
-        let contentHeight = CGFloat(processTimelineRows.count) * processTimelineRowHeight
+        let contentHeight = CGFloat(processTimelineTotalRows) * processTimelineRowHeight
         return max(contentHeight - processTimelineRowsClipLayer.bounds.height, 0)
     }
 
@@ -3469,8 +3549,8 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         let visibleStart = processTimelineVisibleStartIndex()
         for (layerIndex, row) in timelineRowLayers.enumerated() where !row.container.isHidden {
             let processIndex = visibleStart + layerIndex
-            guard processIndex < processTimelineRows.count else { continue }
-            let process = processTimelineRows[processIndex].process
+            guard let timelineRow = processTimelineRow(forGlobalIndex: processIndex) else { continue }
+            let process = timelineRow.process
             let processName = process.process.isEmpty ? "pid-\(process.pid)" : process.process
             let label = "\(processName), pid \(process.pid), \(formatCount(Int(process.eventCount))) events"
             let cells = [
@@ -3501,7 +3581,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                                  frame: processTimelineLayer.frame,
                                  label: "Process timeline",
                                  children: rows,
-                                 rowCount: processTimelineRows.count,
+                                 rowCount: processTimelineTotalRows,
                                  columnCount: 3)
     }
 
