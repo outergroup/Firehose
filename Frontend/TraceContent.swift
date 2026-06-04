@@ -526,7 +526,6 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
 
     private var appearance: NSAppearance?
     private let rootLayer = CALayer()
-    private let titleLayer = CATextLayer()
     private let statusLayer = CATextLayer()
     private let toolbarLayer = CALayer()
     private let pauseButtonLayer = CALayer()
@@ -859,7 +858,6 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         rootLayer.addSublayer(toolbarLayer)
         rootLayer.addSublayer(headerLayer)
         rootLayer.addSublayer(headerBorderLayer)
-        toolbarLayer.addSublayer(titleLayer)
         toolbarLayer.addSublayer(statusLayer)
         toolbarLayer.addSublayer(pauseButtonLayer)
         pauseButtonLayer.addSublayer(pauseButtonIconLayer)
@@ -884,12 +882,6 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         rootLayer.addSublayer(filterPillLayer)
         rootLayer.addSublayer(filterPanelLayer)
         filterPillLayer.addSublayer(filterPillTextLayer)
-
-        titleLayer.font = NSFont.systemFont(ofSize: 15, weight: .semibold)
-        titleLayer.fontSize = 15
-        titleLayer.contentsScale = 2
-        titleLayer.truncationMode = .end
-        titleLayer.string = "Outer Trace"
 
         statusLayer.font = NSFont.systemFont(ofSize: 12, weight: .regular)
         statusLayer.fontSize = 12
@@ -1102,7 +1094,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             layoutScrollbar()
             layoutProcessTimeline()
             layoutFilterUI()
-            layoutToolbarTitle()
+            layoutToolbarStatus()
             updateStatusText()
         }
         notifyAccessibilityLayoutChanged()
@@ -1119,16 +1111,12 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         max(1 / max(headerLayer.contentsScale, 1), 0.5)
     }
 
-    private func layoutToolbarTitle() {
-        let titleMaxX = max(pauseButtonLayer.frame.minX - 16, horizontalInset + 80)
-        let titleWidth = max(titleMaxX - horizontalInset, 1)
-        titleLayer.frame = CGRect(x: horizontalInset,
-                                  y: 31,
-                                  width: titleWidth,
-                                  height: 18)
+    private func layoutToolbarStatus() {
+        let statusMaxX = max(pauseButtonLayer.frame.minX - 16, horizontalInset + 80)
+        let statusWidth = max(statusMaxX - horizontalInset, 1)
         statusLayer.frame = CGRect(x: horizontalInset,
-                                   y: 12,
-                                   width: titleWidth,
+                                   y: 21,
+                                   width: statusWidth,
                                    height: 16)
     }
 
@@ -3280,7 +3268,6 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                 processTimelineHoveredDotLayer.lineWidth = 0
                 processTimelineScrollbarTrackLayer.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.28).cgColor
                 processTimelineScrollbarThumbLayer.backgroundColor = NSColor.secondaryLabelColor.withAlphaComponent(0.36).cgColor
-                titleLayer.foregroundColor = NSColor.labelColor.cgColor
                 pauseButtonLayer.backgroundColor = NSColor.clear.cgColor
                 clearLogButtonLayer.backgroundColor = NSColor.clear.cgColor
                 filterPillLayer.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.94).cgColor
@@ -3428,10 +3415,6 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         var nextIdentifier: UInt32 = 1
         var children: [OuterframeAccessibilityNode] = []
 
-        children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
-                                          role: .staticText,
-                                          frame: toolbarLayer.convert(titleLayer.frame, to: rootLayer),
-                                          label: titleLayer.string as? String ?? "Outer Trace"))
         children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
                                           role: .staticText,
                                           frame: toolbarLayer.convert(statusLayer.frame, to: rootLayer),
