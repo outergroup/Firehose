@@ -629,22 +629,91 @@ static bool read_linux_cmdline_process_name(int pid, char *out, size_t out_size)
     return out[0] != '\0';
 }
 
-static bool should_read_linux_cmdline_process_name(int pid, const char *comm) {
+typedef struct {
+    int pid;
+    bool attempted;
+    bool has_name;
+    char name[PROCESS_NAME_LEN];
+} CmdlineProcessNameCacheEntry;
+
+#define CMDLINE_PROCESS_NAME_CACHE_SIZE 4096
+#define CMDLINE_PROCESS_NAME_CACHE_PROBES 8
+
+static CmdlineProcessNameCacheEntry g_cmdline_process_name_cache[CMDLINE_PROCESS_NAME_CACHE_SIZE] = {0};
+
+static size_t cmdline_process_name_cache_index(int pid) {
+    return ((uint32_t)pid * 2654435761u) & (CMDLINE_PROCESS_NAME_CACHE_SIZE - 1u);
+}
+
+static CmdlineProcessNameCacheEntry *cmdline_process_name_cache_find(int pid, bool create) {
+    if (pid <= 0) {
+        return NULL;
+    }
+    size_t start = cmdline_process_name_cache_index(pid);
+    CmdlineProcessNameCacheEntry *first = &g_cmdline_process_name_cache[start];
+    CmdlineProcessNameCacheEntry *first_empty = NULL;
+    for (size_t probe = 0; probe < CMDLINE_PROCESS_NAME_CACHE_PROBES; probe++) {
+        CmdlineProcessNameCacheEntry *entry =
+            &g_cmdline_process_name_cache[(start + probe) & (CMDLINE_PROCESS_NAME_CACHE_SIZE - 1u)];
+        if (entry->pid == pid) {
+            return entry;
+        }
+        if (create && entry->pid == 0 && !first_empty) {
+            first_empty = entry;
+        }
+    }
+    return create ? (first_empty ? first_empty : first) : NULL;
+}
+
+static void cmdline_process_name_cache_remove_pid(int pid) {
+    CmdlineProcessNameCacheEntry *entry = cmdline_process_name_cache_find(pid, false);
+    if (entry) {
+        memset(entry, 0, sizeof(*entry));
+    }
+}
+
+static void cmdline_process_name_cache_clear(void) {
+    memset(g_cmdline_process_name_cache, 0, sizeof(g_cmdline_process_name_cache));
+}
+
+static bool resolve_linux_cmdline_process_name_once(int pid, const char *comm, char *out, size_t out_size) {
     if (pid <= 0 || !comm || strlen(comm) != 15) {
         return false;
     }
+    if (!out || out_size == 0) {
+        return false;
+    }
 
-    if (strcmp(comm, "FirehoseBackend") != 0) {
+    CmdlineProcessNameCacheEntry *entry = cmdline_process_name_cache_find(pid, true);
+    if (!entry) {
+        return false;
+    }
+
+    if (entry->pid != pid) {
+        memset(entry, 0, sizeof(*entry));
+        entry->pid = pid;
+    }
+
+    if (entry->attempted) {
+        if (!entry->has_name) {
+            return false;
+        }
+        snprintf(out, out_size, "%s", entry->name);
         return true;
     }
 
-    static int firehose_cmdline_lookup_pid = 0;
-    static bool firehose_cmdline_lookup_attempted = false;
-    if (firehose_cmdline_lookup_pid == pid && firehose_cmdline_lookup_attempted) {
+    entry->attempted = true;
+    entry->has_name = false;
+    entry->name[0] = '\0';
+
+    char resolved[PROCESS_NAME_LEN];
+    if (!read_linux_cmdline_process_name(pid, resolved, sizeof(resolved))) {
         return false;
     }
-    firehose_cmdline_lookup_pid = pid;
-    firehose_cmdline_lookup_attempted = true;
+
+    snprintf(entry->name, sizeof(entry->name), "%s", resolved);
+    entry->has_name = true;
+    snprintf(out, out_size, "%s", entry->name);
     return true;
 }
 #endif
@@ -1157,17 +1226,17 @@ static void consume_perf_ring(PerfRing *ring) {
                 copy_from_perf_ring(&bpf_event, data, ring->data_size, tail,
                                      sizeof(header) + sizeof(raw_size), sizeof(bpf_event));
 
+                if (bpf_event.event_type == TRACE_BPF_EVENT_FORK) {
+                    cmdline_process_name_cache_remove_pid(bpf_event.pid);
+                }
+
                 ProcessInfo process = {
                     .pid = bpf_event.pid,
                     .ppid = bpf_event.ppid
                 };
                 snprintf(process.name, sizeof(process.name), "%.*s", (int)sizeof(bpf_event.comm), bpf_event.comm);
-                if (should_read_linux_cmdline_process_name(process.pid, process.name)) {
-                    char cmdline_name[sizeof(process.name)];
-                    if (read_linux_cmdline_process_name(process.pid, cmdline_name, sizeof(cmdline_name))) {
-                        memcpy(process.name, cmdline_name, sizeof(process.name));
-                        process.name[sizeof(process.name) - 1] = '\0';
-                    }
+                if (resolve_linux_cmdline_process_name_once(process.pid, process.name, process.name, sizeof(process.name))) {
+                    process.name[sizeof(process.name) - 1] = '\0';
                 }
                 if (process.name[0] == '\0') {
                     snprintf(process.name, sizeof(process.name), "pid-%d", process.pid);
@@ -1186,6 +1255,7 @@ static void consume_perf_ring(PerfRing *ring) {
                     pending_open_remove_pid(process.pid);
                     fd_path_remove_pid(process.pid);
                     process_parent_remove(process.pid);
+                    cmdline_process_name_cache_remove_pid(process.pid);
                     snprintf(detail, sizeof(detail), "Exited %s", process.name);
                     add_event("process.exit", &process, "", detail);
                 } else if (bpf_event.event_type == TRACE_BPF_EVENT_OPENAT) {
@@ -1217,6 +1287,7 @@ static void consume_perf_ring(PerfRing *ring) {
                     snprintf(detail, sizeof(detail), "path=%s",
                              bpf_event.text[0] ? bpf_event.text : "(unavailable)");
                     add_event("process.execve", &process, event_path, detail);
+                    cmdline_process_name_cache_remove_pid(process.pid);
                 } else if (bpf_event.event_type == TRACE_BPF_EVENT_CLOSE) {
                     process.ppid = process_parent_lookup(process.pid);
                     int fd = (int)bpf_event.arg0;
@@ -1893,6 +1964,9 @@ static bool clear_capture_log(void) {
     g_fd_paths.count = 0;
     pending_open_table_free(&g_pending_opens);
     process_parent_table_free(&g_process_parents);
+#ifdef __linux__
+    cmdline_process_name_cache_clear();
+#endif
 
     if (!event_store_clear(&g_events)) {
         return false;
