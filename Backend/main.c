@@ -628,6 +628,25 @@ static bool read_linux_cmdline_process_name(int pid, char *out, size_t out_size)
     out[base_length] = '\0';
     return out[0] != '\0';
 }
+
+static bool should_read_linux_cmdline_process_name(int pid, const char *comm) {
+    if (pid <= 0 || !comm || strlen(comm) != 15) {
+        return false;
+    }
+
+    if (strcmp(comm, "FirehoseBackend") != 0) {
+        return true;
+    }
+
+    static int firehose_cmdline_lookup_pid = 0;
+    static bool firehose_cmdline_lookup_attempted = false;
+    if (firehose_cmdline_lookup_pid == pid && firehose_cmdline_lookup_attempted) {
+        return false;
+    }
+    firehose_cmdline_lookup_pid = pid;
+    firehose_cmdline_lookup_attempted = true;
+    return true;
+}
 #endif
 
 #ifdef __linux__
@@ -1143,7 +1162,7 @@ static void consume_perf_ring(PerfRing *ring) {
                     .ppid = bpf_event.ppid
                 };
                 snprintf(process.name, sizeof(process.name), "%.*s", (int)sizeof(bpf_event.comm), bpf_event.comm);
-                if (strlen(process.name) == 15) {
+                if (should_read_linux_cmdline_process_name(process.pid, process.name)) {
                     char cmdline_name[sizeof(process.name)];
                     if (read_linux_cmdline_process_name(process.pid, cmdline_name, sizeof(cmdline_name))) {
                         memcpy(process.name, cmdline_name, sizeof(process.name));
