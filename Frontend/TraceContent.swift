@@ -795,6 +795,20 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             outerframeHost.sendCopySelectedPasteboardResponse(requestID: requestID,
                                                               items: pasteboardItemsForCopy())
 
+        case .selectionToPasteboardCutRequest(let requestID):
+            let items = pasteboardItemsForCopy()
+            outerframeHost.sendCopySelectedPasteboardResponse(requestID: requestID,
+                                                              items: items)
+            if filterInputController.isFocused, !items.isEmpty {
+                filterInputController.insertText("")
+            }
+
+        case .editCommandValidationRequest(let requestID, let commands):
+            outerframeHost.sendEditCommandValidationResponse(
+                requestID: requestID,
+                enabledCommands: enabledEditCommands(in: commands)
+            )
+
         case .pasteboardContentPasted(let items):
             handlePasteboardItemsForPaste(items)
 
@@ -1846,10 +1860,6 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             menuItems.append(OuterframeContextMenuItem(id: "paste",
                                                        title: "Paste",
                                                        action: .standardPaste))
-            menuItems.append(OuterframeContextMenuItem(id: "select-all",
-                                                       title: "Select All",
-                                                       action: .standardSelectAll,
-                                                       isEnabled: !filterInputController.text.isEmpty))
             if !selectedText.isEmpty {
                 menuItems.append(OuterframeContextMenuItem(id: "services-separator",
                                                            title: "",
@@ -2476,17 +2486,24 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
 
     private func updateEditingCapabilities() {
         if filterInputController.isFocused {
-            let capabilities = filterInputController.currentEditingCapabilities()
             let acceptedTypes = filterInputController.currentAcceptedPasteboardTypeIdentifiers()
-            outerframeHost.setEditingCapabilities(canCopy: capabilities.canCopy,
-                                                  canCut: capabilities.canCut)
             outerframeHost.setAcceptedPasteboardPasteTypes(acceptedTypes)
             return
         }
 
-        let canCopyCell = selectedTableCell?.value.isEmpty == false
-        outerframeHost.setEditingCapabilities(canCopy: canCopyCell, canCut: false)
         outerframeHost.setAcceptedPasteboardPasteTypes([])
+    }
+
+    private func enabledEditCommands(in requestedCommands: OuterframeEditCommandSet) -> OuterframeEditCommandSet {
+        if filterInputController.isFocused {
+            return filterInputController.enabledEditCommands(in: requestedCommands)
+        }
+
+        var enabledCommands: OuterframeEditCommandSet = []
+        if requestedCommands.contains(.copy), selectedTableCell?.value.isEmpty == false {
+            enabledCommands.insert(.copy)
+        }
+        return enabledCommands
     }
 
     private func pasteboardItemsForCopy() -> [OuterframeContentPasteboardItem] {
