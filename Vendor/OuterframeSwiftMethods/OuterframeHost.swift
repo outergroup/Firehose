@@ -315,6 +315,35 @@ final class OuterframeHost: SocketToBrowserDelegate {
         }
     }
 
+    // MARK: - Presentation
+
+    func setTitle(_ title: String?) {
+        Task {
+            try? await socket.send(ContentToBrowserMessage.setTitle(title).encode())
+        }
+    }
+
+    func setIcon(_ icon: OuterframePresentationIcon) {
+        Task {
+            try? await socket.send(ContentToBrowserMessage.setIcon(icon).encode())
+        }
+    }
+
+    func navigate(to url: URL) {
+        Task {
+            try? await socket.send(ContentToBrowserMessage.navigate(url: url.absoluteString).encode())
+        }
+    }
+
+    func openNewTab(with url: URL, displayString: String?) {
+        Task {
+            try? await socket.send(ContentToBrowserMessage.openNewTab(
+                url: url.absoluteString,
+                displayString: displayString
+            ).encode())
+        }
+    }
+
     // MARK: - Pasteboard
 
     func sendEditCommandValidationResponse(requestID: UUID, enabledCommands: OuterframeEditCommandSet) {
@@ -344,6 +373,15 @@ final class OuterframeHost: SocketToBrowserDelegate {
 
     func setPasteboardDropBehaviorHitTest() {
         Task {
+            try? await socket.send(ContentToBrowserMessage.setPasteboardDropBehaviorHitTest.encode())
+        }
+    }
+
+    func setPasteboardDropBehaviorHitTest(acceptedTypes pasteboardTypeIdentifiers: [String]) {
+        Task {
+            try? await socket.send(ContentToBrowserMessage.setPasteboardDropBehaviorUniform(
+                pasteboardTypeIdentifiers
+            ).encode())
             try? await socket.send(ContentToBrowserMessage.setPasteboardDropBehaviorHitTest.encode())
         }
     }
@@ -511,13 +549,14 @@ final class OuterframeHost: SocketToBrowserDelegate {
     }
 
     func sendAccessibilitySnapshotResponse(requestID: UUID, snapshotData: Data?) {
+        let message = ContentToBrowserMessage.accessibilitySnapshotResponse(
+            requestID: requestID,
+            snapshotData: snapshotData
+        )
         do {
-            try socket.sendBlocking(ContentToBrowserMessage.accessibilitySnapshotResponse(
-                requestID: requestID,
-                snapshotData: snapshotData
-            ).encode())
+            try socket.sendBlocking(message.encode())
         } catch {
-            print("OuterframeHost: Failed to send accessibility snapshot response: \(error)")
+            print("OuterframeHost: Failed to send accessibilitySnapshotResponse: \(error)")
         }
     }
 
@@ -528,10 +567,10 @@ final class OuterframeHost: SocketToBrowserDelegate {
         )
     }
 
-    func notifyAccessibilityTreeChanged(_ notifications: OuterframeAccessibilityNotification = .layoutChanged) {
+    func notifyAccessibilityTreeChanged(_ notification: OuterframeAccessibilityNotification) {
         Task {
             try? await socket.send(ContentToBrowserMessage.accessibilityTreeChanged(
-                notificationMask: notifications.rawValue
+                notificationMask: notification.rawValue
             ).encode())
         }
     }
@@ -603,13 +642,15 @@ final class OuterframeHost: SocketToBrowserDelegate {
     func beginDraggingPasteboardItem(_ item: OuterContentPasteboardItem,
                                      operationMask: NSDragOperation = .copy,
                                      previewPNGData: Data?,
-                                     previewSize: CGSize?) {
+                                     previewSize: CGSize?,
+                                     previewFrameOrigin: CGPoint? = nil) {
         beginDraggingPasteboardItems(
             [
                 OuterContentDraggingItem(
                     pasteboardItem: item,
                     previewImageData: previewPNGData,
-                    previewSize: previewSize
+                    previewSize: previewSize,
+                    previewFrameOrigin: previewFrameOrigin
                 )
             ],
             operationMask: operationMask

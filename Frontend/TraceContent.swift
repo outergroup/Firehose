@@ -683,6 +683,8 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                                      proxyPort: arguments.proxy?.port ?? 0,
                                      proxyUsername: arguments.proxy?.username,
                                      proxyPassword: arguments.proxy?.password)
+            outerframeHost.setTitle("Firehose")
+            outerframeHost.setIcon(.bundleResource(path: "Contents/Resources/app-icon.png"))
             appearance = arguments.appearance ?? NSAppearance.currentDrawing()
             currentSize = arguments.contentSize ?? currentSize
             configureNetworking()
