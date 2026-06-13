@@ -1,6 +1,6 @@
-# Trace
+# Firehose
 
-Trace is a procmon-like outerframe prototype. The backend owns the event buffer and the frontend asks for only the visible event window with `/api/events?start=N&count=M`. Event responses use a little-endian binary format with fixed-size records and `StringRef32` offset/length references into a variable-length string region.
+Firehose is a procmon-like outerframe app. The backend owns the event buffer and the frontend asks for only the visible event window with `/api/events?start=N&count=M`. Event responses use a little-endian binary format with fixed-size records and `StringRef32` offset/length references into a variable-length string region.
 
 The backend stores captured events in an append-only temporary binary file, so the event history is limited by available temporary storage rather than a fixed in-memory ring.
 
@@ -33,7 +33,7 @@ This gives the app an end-to-end event pipeline before adding lower-level syscal
 
 ```bash
 PORT=7352
-./build/macos/Release/TraceBackend --port "$PORT" --bundles-dir ./build/run/bundles
+./build/macos/Release/FirehoseBackend --port "$PORT" --bundles-dir ./build/run/bundles
 ```
 
 Open this URL in Outer Loop or Outer Frame:
@@ -49,11 +49,11 @@ The event API response format starts with magic `TRCE`, version `1`, `total`, `s
 On Linux, the backend requires root and uses the eBPF collector:
 
 ```bash
-sudo ./TraceBackend --port 7353 --bundles-dir ./bundles --capture ebpf
+sudo ./FirehoseBackend --port 7353 --bundles-dir ./bundles --capture ebpf
 ```
 
 ## Current Architecture
 
 - `Frontend/TraceContent.swift`: native outerframe table UI with scroll/key navigation and viewport-sized API fetches.
 - `Backend/main.c`: loopback HTTP server, eBPF process collector, event ring buffer, `.outer` descriptor, and bundle serving.
-- `Scripts/archive_trace_bundle.sh`: creates `TraceContent.bundle.macos-arm.aar` and `TraceContent.bundle.macos-x86.aar`.
+- `Scripts/archive_trace_bundle.sh`: creates `FirehoseContent.bundle.macos-arm.aar` and `FirehoseContent.bundle.macos-x86.aar`.

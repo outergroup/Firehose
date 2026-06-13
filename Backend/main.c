@@ -35,6 +35,9 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#ifndef BPF_FUNC_probe_read_user_str
+#define BPF_FUNC_probe_read_user_str 114
+#endif
 #endif
 
 #define READ_BUFFER_SIZE 8192
@@ -59,6 +62,10 @@
 #define CAPTURE_STATUS_BINARY_MAGIC 0x43535254u
 #define CAPTURE_STATUS_BINARY_VERSION 1
 #define CAPTURE_STATUS_BINARY_HEADER_SIZE 48
+#define CAPTURE_STATUS_FLAG_PAUSED (1u << 0)
+#define CAPTURE_STATUS_FLAG_STORAGE_VALID (1u << 1)
+#define CAPTURE_STATUS_FLAG_STORAGE_LOW (1u << 2)
+#define CAPTURE_STATUS_FLAG_UNSUPPORTED (1u << 3)
 #define PROCESS_NAME_LEN 128
 #define EVENT_PATH_LEN 512
 #define EVENT_FILTER_MAX_CLAUSES 16
@@ -75,11 +82,11 @@
 #define TRACE_UNUSED
 #endif
 
-static const char *kBundleUrlPath = "/bundles/TraceContent";
-static const char *kBundleUrlPathMacosArm = "/bundles/TraceContent/macos-arm";
-static const char *kBundleUrlPathMacosX86 = "/bundles/TraceContent/macos-x86";
-static const char *kBundleFilePathMacosArm = "bundles/TraceContent.bundle.macos-arm.aar";
-static const char *kBundleFilePathMacosX86 = "bundles/TraceContent.bundle.macos-x86.aar";
+static const char *kBundleUrlPath = "/bundles/FirehoseContent";
+static const char *kBundleUrlPathMacosArm = "/bundles/FirehoseContent/macos-arm";
+static const char *kBundleUrlPathMacosX86 = "/bundles/FirehoseContent/macos-x86";
+static const char *kBundleFilePathMacosArm = "bundles/FirehoseContent.bundle.macos-arm.aar";
+static const char *kBundleFilePathMacosX86 = "bundles/FirehoseContent.bundle.macos-x86.aar";
 
 static char g_bundle_file_path_macos_arm[PATH_MAX] = "";
 static char g_bundle_file_path_macos_x86[PATH_MAX] = "";
@@ -235,6 +242,8 @@ static ProcessParentTable g_process_parents = {0};
 static bool g_capture_paused = false;
 static CapturePauseReason g_capture_pause_reason = CAPTURE_PAUSE_REASON_NONE;
 static bool g_capture_uses_ebpf = false;
+static bool g_capture_unsupported = false;
+static char g_capture_unsupported_message[1024] = "";
 static StorageStatus g_storage_status = {0};
 static double g_last_storage_check_time = 0;
 
@@ -915,7 +924,7 @@ static int load_fork_bpf_program(int map_fd, int output_cpu, ForkTracepointOffse
     }
     append_perf_submit(insns, &count, map_fd, output_cpu);
 
-    return load_bpf_program(insns, count, "trace_fork", error, error_size);
+    return load_bpf_program(insns, count, "firehose_fork", error, error_size);
 }
 
 static int load_exit_bpf_program(int map_fd, int output_cpu, char *error, size_t error_size) {
@@ -937,7 +946,7 @@ static int load_exit_bpf_program(int map_fd, int output_cpu, char *error, size_t
     insns[count++] = TRACE_BPF_EMIT_CALL(BPF_FUNC_get_current_comm);
     append_perf_submit(insns, &count, map_fd, output_cpu);
 
-    return load_bpf_program(insns, count, "trace_exit", error, error_size);
+    return load_bpf_program(insns, count, "firehose_exit", error, error_size);
 }
 
 static int load_syscall_bpf_program(int map_fd, int output_cpu, uint32_t event_type,
@@ -1336,7 +1345,7 @@ static void consume_perf_ring(PerfRing *ring) {
                                      sizeof(header) + sizeof(uint64_t), sizeof(lost_count));
             }
             ProcessInfo self = {.pid = 0, .ppid = 0};
-            snprintf(self.name, sizeof(self.name), "trace");
+            snprintf(self.name, sizeof(self.name), "firehose");
             char detail[256];
             if (lost_count > 0) {
                 snprintf(detail, sizeof(detail),
@@ -1491,50 +1500,50 @@ static bool start_ebpf_capture(EBPFCapture *capture, char *error, size_t error_s
             return false;
         }
         int openat_prog_fd = load_syscall_bpf_program(capture->perf_map_fd, cpu, TRACE_BPF_EVENT_OPENAT,
-                                                      openat_offsets, "trace_openat", error, error_size);
+                                                      openat_offsets, "firehose_openat", error, error_size);
         if (!load_and_attach_program(capture, "syscalls", "sys_enter_openat", cpu, openat_prog_fd, error, error_size)) {
             stop_ebpf_capture(capture);
             return false;
         }
         int openat2_prog_fd = load_syscall_bpf_program(capture->perf_map_fd, cpu, TRACE_BPF_EVENT_OPENAT2,
-                                                       openat2_offsets, "trace_openat2", error, error_size);
+                                                       openat2_offsets, "firehose_openat2", error, error_size);
         if (!load_and_attach_program(capture, "syscalls", "sys_enter_openat2", cpu, openat2_prog_fd, error, error_size)) {
             stop_ebpf_capture(capture);
             return false;
         }
         int openat_ret_prog_fd = load_syscall_bpf_program(capture->perf_map_fd, cpu, TRACE_BPF_EVENT_OPENAT_RET,
-                                                          openat_ret_offsets, "trace_openat_ret", error, error_size);
+                                                          openat_ret_offsets, "firehose_openat_ret", error, error_size);
         if (!load_and_attach_program(capture, "syscalls", "sys_exit_openat", cpu, openat_ret_prog_fd, error, error_size)) {
             stop_ebpf_capture(capture);
             return false;
         }
         int openat2_ret_prog_fd = load_syscall_bpf_program(capture->perf_map_fd, cpu, TRACE_BPF_EVENT_OPENAT2_RET,
-                                                           openat2_ret_offsets, "trace_openat2_ret", error, error_size);
+                                                           openat2_ret_offsets, "firehose_openat2_ret", error, error_size);
         if (!load_and_attach_program(capture, "syscalls", "sys_exit_openat2", cpu, openat2_ret_prog_fd, error, error_size)) {
             stop_ebpf_capture(capture);
             return false;
         }
         int execve_prog_fd = load_syscall_bpf_program(capture->perf_map_fd, cpu, TRACE_BPF_EVENT_EXECVE,
-                                                      execve_offsets, "trace_execve", error, error_size);
+                                                      execve_offsets, "firehose_execve", error, error_size);
         if (!load_and_attach_program(capture, "syscalls", "sys_enter_execve", cpu, execve_prog_fd, error, error_size)) {
             stop_ebpf_capture(capture);
             return false;
         }
         int close_prog_fd = load_syscall_bpf_program(capture->perf_map_fd, cpu, TRACE_BPF_EVENT_CLOSE,
-                                                     close_offsets, "trace_close", error, error_size);
+                                                     close_offsets, "firehose_close", error, error_size);
         if (!load_and_attach_program(capture, "syscalls", "sys_enter_close", cpu, close_prog_fd, error, error_size)) {
             stop_ebpf_capture(capture);
             return false;
         }
 #if TRACE_CAPTURE_RW_SYSCALLS
         int read_prog_fd = load_syscall_bpf_program(capture->perf_map_fd, cpu, TRACE_BPF_EVENT_READ,
-                                                    read_offsets, "trace_read", error, error_size);
+                                                    read_offsets, "firehose_read", error, error_size);
         if (!load_and_attach_program(capture, "syscalls", "sys_enter_read", cpu, read_prog_fd, error, error_size)) {
             stop_ebpf_capture(capture);
             return false;
         }
         int write_prog_fd = load_syscall_bpf_program(capture->perf_map_fd, cpu, TRACE_BPF_EVENT_WRITE,
-                                                     write_offsets, "trace_write", error, error_size);
+                                                     write_offsets, "firehose_write", error, error_size);
         if (!load_and_attach_program(capture, "syscalls", "sys_enter_write", cpu, write_prog_fd, error, error_size)) {
             stop_ebpf_capture(capture);
             return false;
@@ -1586,7 +1595,7 @@ static bool event_store_init(EventStore *store) {
     }
 
     char path[PATH_MAX];
-    int n = snprintf(path, sizeof(path), "%s/trace-events-XXXXXX", tmpdir);
+    int n = snprintf(path, sizeof(path), "%s/firehose-events-XXXXXX", tmpdir);
     if (n < 0 || (size_t)n >= sizeof(path)) {
         errno = ENAMETOOLONG;
         return false;
@@ -1741,7 +1750,7 @@ static void add_event(const char *type, const ProcessInfo *process, const char *
     event.pid = process ? process->pid : 0;
     event.ppid = process ? process->ppid : 0;
     snprintf(event.type, sizeof(event.type), "%s", type);
-    snprintf(event.process, sizeof(event.process), "%s", process ? process->name : "trace");
+    snprintf(event.process, sizeof(event.process), "%s", process ? process->name : "firehose");
     snprintf(event.path, sizeof(event.path), "%s", path ? path : "");
     snprintf(event.detail, sizeof(event.detail), "%s", detail);
 
@@ -1752,7 +1761,7 @@ static void add_event(const char *type, const ProcessInfo *process, const char *
         if (!append_event_to_process_timeline_snapshot(&g_unfiltered_process_timeline,
                                                        &event,
                                                        (uint64_t)event_index)) {
-            fprintf(stderr, "TraceBackend failed to update process timeline index: %s\n", strerror(errno));
+            fprintf(stderr, "FirehoseBackend failed to update process timeline index: %s\n", strerror(errno));
             clear_process_timeline_snapshot(&g_unfiltered_process_timeline);
         } else {
             g_unfiltered_process_timeline.filtered_event_count = (uint64_t)g_events.count;
@@ -1764,7 +1773,7 @@ static void add_event(const char *type, const ProcessInfo *process, const char *
             if (event_matches_filter(&event, &g_filtered_process_timeline_cache.filter)) {
                 uint64_t filtered_index = snapshot->filtered_event_count;
                 if (!append_event_to_process_timeline_snapshot(snapshot, &event, filtered_index)) {
-                    fprintf(stderr, "TraceBackend failed to update filtered process timeline index: %s\n",
+                    fprintf(stderr, "FirehoseBackend failed to update filtered process timeline index: %s\n",
                             strerror(errno));
                     clear_filtered_process_timeline_cache();
                 } else {
@@ -1774,7 +1783,7 @@ static void add_event(const char *type, const ProcessInfo *process, const char *
         }
     } else {
         int saved_errno = errno;
-        fprintf(stderr, "TraceBackend failed to append event: %s\n", strerror(errno));
+        fprintf(stderr, "FirehoseBackend failed to append event: %s\n", strerror(errno));
         if (saved_errno == ENOSPC) {
             g_capture_paused = true;
             g_capture_pause_reason = CAPTURE_PAUSE_REASON_LOW_STORAGE;
@@ -1791,14 +1800,14 @@ static void update_process_events(void) {
     ProcessSnapshot current = {0};
     if (!capture_process_snapshot(&current)) {
         ProcessInfo self = {.pid = 0, .ppid = 0};
-        snprintf(self.name, sizeof(self.name), "trace");
+        snprintf(self.name, sizeof(self.name), "firehose");
         add_event("capture.error", &self, "", "Unable to read the process table");
         return;
     }
 
     if (!g_has_previous_snapshot) {
         ProcessInfo self = {.pid = 0, .ppid = 0};
-        snprintf(self.name, sizeof(self.name), "trace");
+        snprintf(self.name, sizeof(self.name), "firehose");
         add_event("capture.start", &self, "", "Started process event capture");
         for (size_t i = 0; i < current.count; ++i) {
             char detail[256];
@@ -1887,7 +1896,7 @@ static void set_capture_paused_internal(bool paused,
     }
 
     ProcessInfo self = {.pid = 0, .ppid = 0};
-    snprintf(self.name, sizeof(self.name), "trace");
+    snprintf(self.name, sizeof(self.name), "firehose");
 
     if (paused) {
         add_event("capture.pause", &self, "", detail ? detail : "Paused event capture");
@@ -1953,6 +1962,23 @@ static void set_capture_paused(bool paused) {
     }
 
     set_capture_paused_internal(false, CAPTURE_PAUSE_REASON_NONE, NULL);
+}
+
+static uint32_t current_capture_flags(void) {
+    uint32_t capture_flags = 0;
+    if (g_capture_paused) {
+        capture_flags |= CAPTURE_STATUS_FLAG_PAUSED;
+    }
+    if (g_storage_status.valid) {
+        capture_flags |= CAPTURE_STATUS_FLAG_STORAGE_VALID;
+    }
+    if (g_storage_status.valid && g_storage_status.low) {
+        capture_flags |= CAPTURE_STATUS_FLAG_STORAGE_LOW;
+    }
+    if (g_capture_unsupported) {
+        capture_flags |= CAPTURE_STATUS_FLAG_UNSUPPORTED;
+    }
+    return capture_flags;
 }
 
 static bool clear_capture_log(void) {
@@ -2260,7 +2286,8 @@ static bool is_known_process_name(const char *process) {
     return process &&
            process[0] != '\0' &&
            strcmp(process, "unknown") != 0 &&
-           strcmp(process, "trace") != 0;
+           strcmp(process, "firehose") != 0 &&
+           strcmp(process, "FirehoseBackend") != 0;
 }
 
 static const char *path_basename(const char *path) {
@@ -2861,16 +2888,7 @@ static size_t build_events_binary(size_t start, size_t count, bool tail, const E
     write_uint32_le(buffer + 24, (uint32_t)event_count);
     write_uint32_le(buffer + 28, EVENT_BINARY_RECORD_SIZE);
     write_uint64_le(buffer + 32, (uint64_t)g_events.count);
-    uint32_t capture_flags = 0;
-    if (g_capture_paused) {
-        capture_flags |= 1u << 0;
-    }
-    if (g_storage_status.valid) {
-        capture_flags |= 1u << 1;
-    }
-    if (g_storage_status.valid && g_storage_status.low) {
-        capture_flags |= 1u << 2;
-    }
+    uint32_t capture_flags = current_capture_flags();
     write_uint32_le(buffer + 40, capture_flags);
     write_uint32_le(buffer + 44, (uint32_t)g_capture_pause_reason);
     write_uint64_le(buffer + 48, g_storage_status.available_bytes);
@@ -3226,7 +3244,7 @@ static void send_events_response(int fd, const char *query) {
         send_text_response(fd, 500, "failed to build events response\n");
         return;
     }
-    send_response(fd, 200, "OK", "application/vnd.trace.events", payload, len);
+    send_response(fd, 200, "OK", "application/vnd.firehose.events", payload, len);
     free(payload);
 }
 
@@ -3348,7 +3366,7 @@ static void send_event_position_response(int fd, const char *query) {
         send_text_response(fd, 500, "failed to build event position response\n");
         return;
     }
-    send_response(fd, 200, "OK", "application/vnd.trace.position", payload, len);
+    send_response(fd, 200, "OK", "application/vnd.firehose.position", payload, len);
     free(payload);
 }
 
@@ -3364,7 +3382,7 @@ static void send_process_timeline_response(int fd, const char *query) {
         send_text_response(fd, 500, "failed to build process timeline response\n");
         return;
     }
-    send_response(fd, 200, "OK", "application/vnd.trace.processes", payload, len);
+    send_response(fd, 200, "OK", "application/vnd.firehose.processes", payload, len);
     free(payload);
 }
 
@@ -3393,28 +3411,22 @@ static void send_clear_log_response(int fd) {
     send_response(fd,
                   cleared ? 200 : 500,
                   cleared ? "OK" : "Internal Server Error",
-                  "application/vnd.trace.clear",
+                  "application/vnd.firehose.clear",
                   payload,
                   len);
     free(payload);
 }
 
 static size_t build_capture_status_binary(unsigned char **buffer_out) {
-    unsigned char *buffer = calloc(1, CAPTURE_STATUS_BINARY_HEADER_SIZE);
+    const char *unsupported_message = g_capture_unsupported ? g_capture_unsupported_message : "";
+    size_t message_len = strlen(unsupported_message);
+    size_t total_size = CAPTURE_STATUS_BINARY_HEADER_SIZE + message_len;
+    unsigned char *buffer = calloc(1, total_size == 0 ? 1 : total_size);
     if (!buffer) {
         return 0;
     }
 
-    uint32_t capture_flags = 0;
-    if (g_capture_paused) {
-        capture_flags |= 1u << 0;
-    }
-    if (g_storage_status.valid) {
-        capture_flags |= 1u << 1;
-    }
-    if (g_storage_status.valid && g_storage_status.low) {
-        capture_flags |= 1u << 2;
-    }
+    uint32_t capture_flags = current_capture_flags();
 
     write_uint32_le(buffer + 0, CAPTURE_STATUS_BINARY_MAGIC);
     write_uint16_le(buffer + 4, CAPTURE_STATUS_BINARY_VERSION);
@@ -3424,10 +3436,14 @@ static size_t build_capture_status_binary(unsigned char **buffer_out) {
     write_uint64_le(buffer + 16, g_storage_status.available_bytes);
     write_uint64_le(buffer + 24, g_storage_status.threshold_bytes);
     write_uint64_le(buffer + 32, g_storage_status.total_bytes);
-    write_uint64_le(buffer + 40, 0);
+    if (message_len > 0) {
+        write_uint32_le(buffer + 40, CAPTURE_STATUS_BINARY_HEADER_SIZE);
+        write_uint32_le(buffer + 44, (uint32_t)message_len);
+        memcpy(buffer + CAPTURE_STATUS_BINARY_HEADER_SIZE, unsupported_message, message_len);
+    }
 
     *buffer_out = buffer;
-    return CAPTURE_STATUS_BINARY_HEADER_SIZE;
+    return total_size;
 }
 
 static void send_capture_response(int fd, const char *query) {
@@ -3446,7 +3462,7 @@ static void send_capture_response(int fd, const char *query) {
         send_text_response(fd, 500, "failed to build capture status response\n");
         return;
     }
-    send_response(fd, 200, "OK", "application/vnd.trace.capture", payload, len);
+    send_response(fd, 200, "OK", "application/vnd.firehose.capture", payload, len);
     free(payload);
 }
 
@@ -3482,7 +3498,7 @@ static void handle_client(int fd) {
         query++;
     }
 
-    if (strcmp(target, "/") == 0 || strcmp(target, "/trace.outer") == 0) {
+    if (strcmp(target, "/") == 0 || strcmp(target, "/firehose.outer") == 0) {
         send_outer_descriptor(fd);
     } else if (strcmp(target, kBundleUrlPath) == 0) {
         send_text_response(fd, 200, "macos-arm\nmacos-x86\n");
@@ -3637,7 +3653,7 @@ int main(int argc, char **argv) {
 
     int port = DEFAULT_PORT;
     const char *socket_path = NULL;
-    const char *label = "TraceBackend";
+    const char *label = "FirehoseBackend";
     const char *icon_file = NULL;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
@@ -3651,9 +3667,9 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--bundles-dir") == 0 && i + 1 < argc) {
             const char *dir = argv[++i];
             snprintf(g_bundle_file_path_macos_arm, sizeof(g_bundle_file_path_macos_arm),
-                     "%s/TraceContent.bundle.macos-arm.aar", dir);
+                     "%s/FirehoseContent.bundle.macos-arm.aar", dir);
             snprintf(g_bundle_file_path_macos_x86, sizeof(g_bundle_file_path_macos_x86),
-                     "%s/TraceContent.bundle.macos-x86.aar", dir);
+                     "%s/FirehoseContent.bundle.macos-x86.aar", dir);
         } else if (strcmp(argv[i], "--capture") == 0 && i + 1 < argc) {
             const char *capture_mode = argv[++i];
             if (strcmp(capture_mode, "ebpf") != 0) {
@@ -3675,7 +3691,7 @@ int main(int argc, char **argv) {
 
 #ifdef __linux__
     if (geteuid() != 0) {
-        fprintf(stderr, "TraceBackend requires root privileges for eBPF capture. Install Firehose as a root backend or run it with sudo.\n");
+        fprintf(stderr, "FirehoseBackend requires root privileges for eBPF capture. Install Firehose as a root backend or run it with sudo.\n");
         return 1;
     }
 #endif
@@ -3691,19 +3707,22 @@ int main(int argc, char **argv) {
     ebpf_error[0] = '\0';
     using_ebpf = start_ebpf_capture(&g_ebpf_capture, ebpf_error, sizeof(ebpf_error));
     if (!using_ebpf) {
-        fprintf(stderr, "TraceBackend eBPF capture failed: %s\n", ebpf_error);
+        fprintf(stderr, "FirehoseBackend eBPF capture failed: %s\n", ebpf_error);
         stop_ebpf_capture(&g_ebpf_capture);
-        event_store_close(&g_events);
-        fd_path_table_free(&g_fd_paths);
-        pending_open_table_free(&g_pending_opens);
-        process_parent_table_free(&g_process_parents);
-        return 1;
+        g_capture_unsupported = true;
+        snprintf(g_capture_unsupported_message,
+                 sizeof(g_capture_unsupported_message),
+                 "Firehose cannot capture events on this machine because eBPF setup failed: %s",
+                 ebpf_error);
+        ProcessInfo self = {.pid = 0, .ppid = 0};
+        snprintf(self.name, sizeof(self.name), "firehose");
+        add_event("capture.unsupported", &self, "", g_capture_unsupported_message);
+    } else {
+        g_capture_uses_ebpf = true;
+        ProcessInfo self = {.pid = 0, .ppid = 0};
+        snprintf(self.name, sizeof(self.name), "firehose");
+        add_event("capture.start", &self, "", "Started eBPF process capture on sched_process_fork and sched_process_exit");
     }
-
-    g_capture_uses_ebpf = true;
-    ProcessInfo self = {.pid = 0, .ppid = 0};
-    snprintf(self.name, sizeof(self.name), "trace");
-    add_event("capture.start", &self, "", "Started eBPF process capture on sched_process_fork and sched_process_exit");
 #else
     bool using_ebpf = false;
     g_capture_uses_ebpf = false;

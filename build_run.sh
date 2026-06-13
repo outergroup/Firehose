@@ -22,7 +22,7 @@ require_tool lipo
 rm -rf "${RUN_ROOT}"
 mkdir -p "${BUILD_ROOT}" "${RUN_ROOT}/bundles"
 
-echo "==> Building Trace.bundle"
+echo "==> Building Firehose frontend bundle"
 /usr/bin/xcodebuild \
     -project "${SCRIPT_DIR}/Trace.xcodeproj" \
     -scheme Trace \
@@ -34,20 +34,20 @@ echo "==> Building Trace.bundle"
     CODE_SIGNING_REQUIRED=NO \
     build
 
-echo "==> Archiving TraceContent bundles"
+echo "==> Archiving FirehoseContent bundles"
 "${SCRIPT_DIR}/Scripts/archive_trace_bundle.sh" \
     "${BUILD_ROOT}/${CONFIGURATION}/Trace.bundle" \
     "${RUN_ROOT}/bundles" \
-    TraceContent.bundle
+    FirehoseContent.bundle
 
-echo "==> Building TraceBackend"
+echo "==> Building FirehoseBackend"
 cc -std=gnu17 -Wall -Wextra -O2 \
-    -o "${BUILD_ROOT}/${CONFIGURATION}/TraceBackend" \
+    -o "${BUILD_ROOT}/${CONFIGURATION}/FirehoseBackend" \
     "${SCRIPT_DIR}/Backend/main.c"
 
 echo "Built:"
-echo "  ${BUILD_ROOT}/${CONFIGURATION}/TraceBackend"
+echo "  ${BUILD_ROOT}/${CONFIGURATION}/FirehoseBackend"
 echo "  ${RUN_ROOT}/bundles"
 echo
 echo "Run:"
-echo "  \"${BUILD_ROOT}/${CONFIGURATION}/TraceBackend\" --port 7352 --bundles-dir \"${RUN_ROOT}/bundles\""
+echo "  \"${BUILD_ROOT}/${CONFIGURATION}/FirehoseBackend\" --port 7352 --bundles-dir \"${RUN_ROOT}/bundles\""

@@ -9,7 +9,7 @@ fi
 
 SOURCE_BUNDLE="$1"
 DESTINATION_DIR="$2"
-ARCHIVE_STEM="${3:-TraceContent.bundle}"
+ARCHIVE_STEM="${3:-FirehoseContent.bundle}"
 AA_TOOL="${AA_TOOL:-aa}"
 
 if [[ ! -d "$SOURCE_BUNDLE" ]]; then
