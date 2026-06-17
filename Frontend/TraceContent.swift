@@ -752,7 +752,17 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
 
         case .mouseDown(let point, let modifierFlags, let clickCount):
             if isMachineUnsupported {
+                if modifierFlags.contains(.control) {
+                    showMachineUnsupportedContextMenu(at: point)
+                    return
+                }
                 handleMachineUnsupportedMouseDown(at: point, clickCount: clickCount)
+                return
+            }
+            if modifierFlags.contains(.control) {
+                if !handleFilterContextMenu(at: point) {
+                    handleCellContextMenu(at: point)
+                }
                 return
             }
             if !handleToolbarMouseDown(at: point),
