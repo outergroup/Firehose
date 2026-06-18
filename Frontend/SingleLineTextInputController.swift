@@ -17,6 +17,8 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
     private(set) var cursorPosition: Int
     private var selectionAnchor: Int?
     private(set) var isFocused: Bool
+    private var markedTextRange: Range<Int>?
+    private var pendingMarkedTextRange: Range<Int>?
     private let acceptedPasteboardTypeIdentifiers: [String]
 
     init(identifier: UUID,
@@ -60,6 +62,8 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
         guard isFocused else { return }
         isFocused = false
         selectionAnchor = nil
+        markedTextRange = nil
+        pendingMarkedTextRange = nil
         notifyStateChanged()
     }
 
@@ -67,6 +71,8 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
         text = newText
         cursorPosition = min(cursorPosition, text.count)
         selectionAnchor = nil
+        markedTextRange = nil
+        pendingMarkedTextRange = nil
         notifyStateChanged()
     }
 
@@ -74,7 +80,7 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
         guard isFocused else { return }
 
         if let replacementRange {
-            replace(range: replacementRange, with: value)
+            replace(range: replacementRange, with: value, clearsMarkedText: true)
             return
         }
 
@@ -95,6 +101,11 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
             return
         }
 
+        if let range = markedTextRange ?? pendingMarkedTextRange {
+            replace(range: range, with: value, clearsMarkedText: true)
+            return
+        }
+
         if hasSelection {
             deleteSelection()
         }
@@ -103,6 +114,42 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
         text.insert(contentsOf: value, at: index)
         cursorPosition += value.count
         selectionAnchor = nil
+        markedTextRange = nil
+        pendingMarkedTextRange = nil
+        notifyStateChanged()
+    }
+
+    func setMarkedText(_ markedText: String,
+                       selectedLocation: Int,
+                       selectedLength: Int,
+                       replacementRange: Range<Int>?) {
+        guard isFocused else { return }
+        let range = normalizedRange(replacementRange)
+            ?? markedTextRange
+            ?? selectionRange
+            ?? cursorPosition..<cursorPosition
+        let lower = min(max(range.lowerBound, 0), text.count)
+        let newMarkedRange = lower..<(lower + markedText.count)
+        markedTextRange = markedText.isEmpty ? nil : newMarkedRange
+        pendingMarkedTextRange = nil
+        replace(range: range, with: markedText, clearsMarkedText: false)
+
+        let selectedLower = min(max(selectedLocation, 0), markedText.count)
+        let selectedUpper = min(max(selectedLower + selectedLength, selectedLower), markedText.count)
+        if selectedUpper > selectedLower {
+            selectionAnchor = lower + selectedLower
+            cursorPosition = lower + selectedUpper
+        } else {
+            selectionAnchor = nil
+            cursorPosition = lower + selectedLower
+        }
+        notifyStateChanged()
+    }
+
+    func unmarkText() {
+        guard isFocused else { return }
+        pendingMarkedTextRange = markedTextRange
+        markedTextRange = nil
         notifyStateChanged()
     }
 
@@ -161,6 +208,7 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
 
     func setCursorPosition(_ position: Int, modifySelection: Bool) {
         guard isFocused else { return }
+        clearMarkedTextState()
         let clamped = clamp(position)
         if modifySelection {
             extendSelection(to: clamped)
@@ -173,6 +221,7 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
 
     func selectAll() {
         guard isFocused else { return }
+        clearMarkedTextState()
         selectionAnchor = 0
         cursorPosition = text.count
         notifyStateChanged()
@@ -180,6 +229,7 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
 
     func selectWord(at position: Int) {
         guard isFocused else { return }
+        clearMarkedTextState()
         let clamped = clamp(position)
         selectionAnchor = findPreviousWordBoundary(from: clamped)
         cursorPosition = findNextWordBoundary(from: clamped)
@@ -219,13 +269,17 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
         isFocused ? acceptedPasteboardTypeIdentifiers : []
     }
 
-    private func replace(range: Range<Int>, with value: String) {
+    private func replace(range: Range<Int>, with value: String, clearsMarkedText: Bool = true) {
         let clampedRange = clamp(range.lowerBound)..<clamp(range.upperBound)
         let lower = stringIndex(forCharacterIndex: clampedRange.lowerBound)
         let upper = stringIndex(forCharacterIndex: clampedRange.upperBound)
         text.replaceSubrange(lower..<upper, with: value)
         cursorPosition = clampedRange.lowerBound + value.count
         selectionAnchor = nil
+        if clearsMarkedText {
+            markedTextRange = nil
+            pendingMarkedTextRange = nil
+        }
         notifyStateChanged()
     }
 
@@ -235,6 +289,7 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
             return
         }
         guard cursorPosition > 0 else { return }
+        clearMarkedTextState()
         let removeIndex = text.index(text.startIndex, offsetBy: cursorPosition - 1)
         text.remove(at: removeIndex)
         cursorPosition -= 1
@@ -248,6 +303,7 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
             return
         }
         guard cursorPosition < text.count else { return }
+        clearMarkedTextState()
         let removeIndex = stringIndex(forCharacterIndex: cursorPosition)
         text.remove(at: removeIndex)
         selectionAnchor = nil
@@ -255,6 +311,7 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
     }
 
     private func moveCursorLeft() {
+        clearMarkedTextState()
         if let selectionRange {
             cursorPosition = selectionRange.lowerBound
             selectionAnchor = nil
@@ -268,6 +325,7 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
     }
 
     private func moveCursorRight() {
+        clearMarkedTextState()
         if let selectionRange {
             cursorPosition = selectionRange.upperBound
             selectionAnchor = nil
@@ -281,18 +339,21 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
     }
 
     private func moveToBeginning() {
+        clearMarkedTextState()
         cursorPosition = 0
         selectionAnchor = nil
         notifyStateChanged()
     }
 
     private func moveToEnd() {
+        clearMarkedTextState()
         cursorPosition = text.count
         selectionAnchor = nil
         notifyStateChanged()
     }
 
     private func moveWordLeft() {
+        clearMarkedTextState()
         if let selectionRange {
             cursorPosition = selectionRange.lowerBound
             selectionAnchor = nil
@@ -305,6 +366,7 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
     }
 
     private func moveWordRight() {
+        clearMarkedTextState()
         if let selectionRange {
             cursorPosition = selectionRange.upperBound
             selectionAnchor = nil
@@ -317,31 +379,38 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
     }
 
     private func moveLeftAndModifySelection() {
+        clearMarkedTextState()
         extendSelection(to: max(0, cursorPosition - 1))
     }
 
     private func moveRightAndModifySelection() {
+        clearMarkedTextState()
         extendSelection(to: min(text.count, cursorPosition + 1))
     }
 
     private func moveWordLeftAndModifySelection() {
+        clearMarkedTextState()
         extendSelection(to: findPreviousWordBoundary(from: cursorPosition))
     }
 
     private func moveWordRightAndModifySelection() {
+        clearMarkedTextState()
         extendSelection(to: findNextWordBoundary(from: cursorPosition))
     }
 
     private func moveToBeginningAndModifySelection() {
+        clearMarkedTextState()
         extendSelection(to: 0)
     }
 
     private func moveToEndAndModifySelection() {
+        clearMarkedTextState()
         extendSelection(to: text.count)
     }
 
     private func deleteSelection() {
         guard let range = selectionRange else { return }
+        clearMarkedTextState()
         let lower = stringIndex(forCharacterIndex: range.lowerBound)
         let upper = stringIndex(forCharacterIndex: range.upperBound)
         text.removeSubrange(lower..<upper)
@@ -450,6 +519,18 @@ final class SingleLineTextInputController<DelegateClass: SingleLineTextInputCont
 
     private func stringIndex(forCharacterIndex index: Int) -> String.Index {
         text.index(text.startIndex, offsetBy: index)
+    }
+
+    private func normalizedRange(_ range: Range<Int>?) -> Range<Int>? {
+        guard let range else { return nil }
+        let lower = min(max(range.lowerBound, 0), text.count)
+        let upper = min(max(range.upperBound, lower), text.count)
+        return lower..<upper
+    }
+
+    private func clearMarkedTextState() {
+        markedTextRange = nil
+        pendingMarkedTextRange = nil
     }
 
     private func characterIndexForUTF16(_ utf16Index: Int) -> Int {

@@ -833,11 +833,18 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                                       replacementLocation: replacementLocation,
                                       replacementLength: replacementLength)
 
-        case .setMarkedText:
-            break
+        case .setMarkedText(let text, let selectedLocation, let selectedLength, let hasReplacementRange, let replacementLocation, let replacementLength):
+            guard !isMachineUnsupported else { return }
+            _ = handleFilterSetMarkedText(text,
+                                          selectedLocation: Int(selectedLocation),
+                                          selectedLength: Int(selectedLength),
+                                          hasReplacementRange: hasReplacementRange,
+                                          replacementLocation: replacementLocation,
+                                          replacementLength: replacementLength)
 
         case .unmarkText:
-            break
+            guard !isMachineUnsupported else { return }
+            _ = handleFilterUnmarkText()
 
         case .textCommand(let command):
             guard !isMachineUnsupported else { return }
@@ -2112,6 +2119,28 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                                          replacementRange: replacementRange(hasReplacementRange: hasReplacementRange,
                                                                             location: replacementLocation,
                                                                             length: replacementLength))
+        return true
+    }
+
+    private func handleFilterSetMarkedText(_ text: String,
+                                           selectedLocation: Int,
+                                           selectedLength: Int,
+                                           hasReplacementRange: Bool,
+                                           replacementLocation: UInt64,
+                                           replacementLength: UInt64) -> Bool {
+        guard isFilterPanelExpanded else { return false }
+        filterInputController.setMarkedText(text,
+                                            selectedLocation: selectedLocation,
+                                            selectedLength: selectedLength,
+                                            replacementRange: replacementRange(hasReplacementRange: hasReplacementRange,
+                                                                               location: replacementLocation,
+                                                                               length: replacementLength))
+        return true
+    }
+
+    private func handleFilterUnmarkText() -> Bool {
+        guard isFilterPanelExpanded else { return false }
+        filterInputController.unmarkText()
         return true
     }
 
