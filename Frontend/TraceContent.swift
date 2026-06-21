@@ -170,7 +170,6 @@ private enum FilterColumn: String, CaseIterable {
     case time
     case event
     case pid
-    case ppid
     case process
     case path
     case detail
@@ -180,7 +179,6 @@ private enum FilterColumn: String, CaseIterable {
         case .time: return "Time"
         case .event: return "Event"
         case .pid: return "PID"
-        case .ppid: return "PPID"
         case .process: return "Process"
         case .path: return "Path"
         case .detail: return "Detail"
@@ -615,6 +613,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     private var activeFilterIndex = 0
     private var isSyncingFilterInput = false
     private var filterClauses: [FilterClause] = []
+    private var appliedFilterClauses: [FilterClause] = []
     private var pendingFilterContextMenuID: UUID?
     private var pendingCellContextMenuID: UUID?
     private var pendingCellFilterContext: CellFilterContext?
@@ -2066,8 +2065,6 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             return event.type
         case .pid:
             return event.pid > 0 ? String(event.pid) : ""
-        case .ppid:
-            return event.ppid > 0 ? String(event.ppid) : ""
         case .process:
             return event.process
         case .path:
@@ -2180,7 +2177,10 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     }
 
     private func addFilterClause(_ clause: FilterClause) {
-        if filterClauses.count < maxFilterClauseRows {
+        if let emptyIndex = filterClauses.firstIndex(where: { $0.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) {
+            filterClauses[emptyIndex] = clause
+            activeFilterIndex = emptyIndex
+        } else if filterClauses.count < maxFilterClauseRows {
             filterClauses.append(clause)
             activeFilterIndex = filterClauses.count - 1
         } else if filterClauses.indices.contains(activeFilterIndex) {
@@ -2242,6 +2242,14 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     }
 
     private func applyFilterChange() {
+        if hasIncompleteFilterClause() {
+            updateFilterText()
+            updateLayout()
+            updateTextInputState()
+            return
+        }
+
+        appliedFilterClauses = activeFilterClauses()
         scrollOffset = 0
         processTimelineScrollOffset = 0
         resetScrollPrediction()
@@ -3113,11 +3121,20 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     }
 
     private func activeFilterClauses() -> [FilterClause] {
-        filterClauses.filter { !$0.value.isEmpty }
+        filterClauses.filter { !$0.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
+    private func hasIncompleteFilterClause() -> Bool {
+        filterClauses.contains { $0.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
+    private func requestFilterClauses() -> [FilterClause] {
+        appliedFilterClauses
     }
 
     private func currentFilterSummary() -> String {
-        let parts = activeFilterClauses().map { clause in
+        let summaryClauses = hasIncompleteFilterClause() ? appliedFilterClauses : activeFilterClauses()
+        let parts = summaryClauses.map { clause in
             "\(clause.column.title) \(clause.operation.title.lowercased()) \(clause.value)"
         }
         return parts.isEmpty ? "Filter: All events" : parts.joined(separator: "  ")
@@ -3393,13 +3410,13 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     }
 
     private func currentFilterKey() -> String {
-        activeFilterClauses()
+        requestFilterClauses()
             .map { "\($0.column.rawValue)\u{1F}\($0.operation.rawValue)\u{1F}\($0.value)" }
             .joined(separator: "\u{1E}")
     }
 
     private func activeFilterQueryItems() -> [URLQueryItem] {
-        let clauses = activeFilterClauses()
+        let clauses = requestFilterClauses()
         var queryItems = [URLQueryItem(name: "filterCount", value: String(clauses.count))]
         for (index, clause) in clauses.enumerated() {
             queryItems.append(URLQueryItem(name: "f\(index)column", value: clause.column.rawValue))
