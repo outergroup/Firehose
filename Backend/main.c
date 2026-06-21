@@ -773,6 +773,8 @@ typedef struct {
     size_t prog_fd_count;
     int *tracepoint_fds;
     size_t tracepoint_fd_count;
+    int *link_fds;
+    size_t link_fd_count;
     PerfRing *rings;
     int cpu_count;
     long page_size;
@@ -782,6 +784,7 @@ typedef struct {
     int parent_pid;
     int child_comm;
     int child_pid;
+    bool child_comm_is_data_loc;
 } ForkTracepointOffsets;
 
 typedef struct {
@@ -805,8 +808,17 @@ _Static_assert(sizeof(BPFKernelEvent) == TRACE_BPF_EVENT_SIZE, "unexpected BPF e
 #define TRACE_BPF_STX_MEM(SIZE, DST, SRC, OFF) TRACE_BPF_INSN(BPF_STX | BPF_MEM | (SIZE), DST, SRC, OFF, 0)
 #define TRACE_BPF_EMIT_CALL(FUNC) TRACE_BPF_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, FUNC)
 #define TRACE_BPF_EXIT_INSN() TRACE_BPF_INSN(BPF_JMP | BPF_EXIT, 0, 0, 0, 0)
+#define TRACE_BPF_LINK_CREATE_CMD ((enum bpf_cmd)28)
+#define TRACE_BPF_PERF_EVENT_ATTACH_TYPE 41u
 
-static int trace_bpf(enum bpf_cmd command, union bpf_attr *attr, unsigned int size) {
+typedef struct {
+    uint32_t prog_fd;
+    uint32_t target_fd;
+    uint32_t attach_type;
+    uint32_t flags;
+} TraceBPFLinkCreateAttr;
+
+static int trace_bpf(enum bpf_cmd command, void *attr, unsigned int size) {
     return (int)syscall(__NR_bpf, command, attr, size);
 }
 
@@ -918,9 +930,11 @@ static int load_fork_bpf_program(int map_fd, int output_cpu, ForkTracepointOffse
     insns[count++] = TRACE_BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_2, TRACE_BPF_STACK_OFF + 20);
     insns[count++] = TRACE_BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_6, offsets.parent_pid);
     insns[count++] = TRACE_BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_2, TRACE_BPF_STACK_OFF + 16);
-    for (int i = 0; i < 16; i += 4) {
-        insns[count++] = TRACE_BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_6, offsets.child_comm + i);
-        insns[count++] = TRACE_BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_2, TRACE_BPF_STACK_OFF + 40 + i);
+    if (!offsets.child_comm_is_data_loc) {
+        for (int i = 0; i < 16; i += 4) {
+            insns[count++] = TRACE_BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_6, offsets.child_comm + i);
+            insns[count++] = TRACE_BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_2, TRACE_BPF_STACK_OFF + 40 + i);
+        }
     }
     append_perf_submit(insns, &count, map_fd, output_cpu);
 
@@ -1051,11 +1065,31 @@ static bool parse_tracepoint_field_offset(const char *format, const char *field,
     return false;
 }
 
+static bool tracepoint_field_is_data_loc(const char *format, const char *field) {
+    char field_with_semicolon[96];
+    char field_with_array[96];
+    snprintf(field_with_semicolon, sizeof(field_with_semicolon), " %s;", field);
+    snprintf(field_with_array, sizeof(field_with_array), " %s[", field);
+
+    const char *line = format;
+    while (line && *line) {
+        const char *line_end = strchr(line, '\n');
+        size_t line_len = line_end ? (size_t)(line_end - line) : strlen(line);
+        if ((memmem(line, line_len, field_with_semicolon, strlen(field_with_semicolon)) ||
+             memmem(line, line_len, field_with_array, strlen(field_with_array)))) {
+            return memmem(line, line_len, "__data_loc", 10) != NULL;
+        }
+        line = line_end ? line_end + 1 : NULL;
+    }
+    return false;
+}
+
 static ForkTracepointOffsets read_fork_tracepoint_offsets(void) {
     ForkTracepointOffsets offsets = {
         .parent_pid = TRACE_BPF_FORK_PARENT_PID_OFFSET,
         .child_comm = TRACE_BPF_FORK_CHILD_COMM_OFFSET,
-        .child_pid = TRACE_BPF_FORK_CHILD_PID_OFFSET
+        .child_pid = TRACE_BPF_FORK_CHILD_PID_OFFSET,
+        .child_comm_is_data_loc = false
     };
 
     char format[8192];
@@ -1065,6 +1099,7 @@ static ForkTracepointOffsets read_fork_tracepoint_offsets(void) {
     parse_tracepoint_field_offset(format, "parent_pid", &offsets.parent_pid);
     parse_tracepoint_field_offset(format, "child_comm", &offsets.child_comm);
     parse_tracepoint_field_offset(format, "child_pid", &offsets.child_pid);
+    offsets.child_comm_is_data_loc = tracepoint_field_is_data_loc(format, "child_comm");
     return offsets;
 }
 
@@ -1121,8 +1156,21 @@ static int open_perf_output_ring(int cpu, long page_size, PerfRing *ring, char *
     return fd;
 }
 
+static int create_bpf_perf_event_link(int prog_fd, int perf_fd) {
+    TraceBPFLinkCreateAttr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.prog_fd = (uint32_t)prog_fd;
+    attr.target_fd = (uint32_t)perf_fd;
+    attr.attach_type = TRACE_BPF_PERF_EVENT_ATTACH_TYPE;
+    return trace_bpf(TRACE_BPF_LINK_CREATE_CMD, &attr, sizeof(attr));
+}
+
 static int open_tracepoint_attachment(const char *group_name, const char *event_name, int cpu, int prog_fd,
-                                      char *error, size_t error_size) {
+                                      int *link_fd_out, char *error, size_t error_size) {
+    if (link_fd_out) {
+        *link_fd_out = -1;
+    }
+
     int tracepoint_id = 0;
     if (!read_tracepoint_id(group_name, event_name, &tracepoint_id)) {
         snprintf(error, error_size, "could not read tracepoint id for %s/%s", group_name, event_name);
@@ -1134,8 +1182,10 @@ static int open_tracepoint_attachment(const char *group_name, const char *event_
     attr.type = PERF_TYPE_TRACEPOINT;
     attr.size = sizeof(attr);
     attr.config = (uint64_t)tracepoint_id;
+    attr.sample_type = PERF_SAMPLE_RAW;
     attr.sample_period = 1;
     attr.wakeup_events = 1;
+    attr.disabled = 1;
 
     int fd = trace_perf_event_open(&attr, -1, cpu, -1, PERF_FLAG_FD_CLOEXEC);
     if (fd < 0) {
@@ -1143,15 +1193,32 @@ static int open_tracepoint_attachment(const char *group_name, const char *event_
                  group_name, event_name, cpu, strerror(errno));
         return -1;
     }
-    if (ioctl(fd, PERF_EVENT_IOC_SET_BPF, prog_fd) != 0) {
-        snprintf(error, error_size, "PERF_EVENT_IOC_SET_BPF %s/%s cpu %d failed: %s",
-                 group_name, event_name, cpu, strerror(errno));
-        close(fd);
-        return -1;
+
+    int link_fd = create_bpf_perf_event_link(prog_fd, fd);
+    if (link_fd >= 0) {
+        if (link_fd_out) {
+            *link_fd_out = link_fd;
+        }
+    } else {
+        int link_errno = errno;
+        if (ioctl(fd, PERF_EVENT_IOC_SET_BPF, prog_fd) != 0) {
+            int ioctl_errno = errno;
+            snprintf(error, error_size,
+                     "BPF_LINK_CREATE %s/%s cpu %d failed: %s; PERF_EVENT_IOC_SET_BPF failed: %s",
+                     group_name, event_name, cpu, strerror(link_errno), strerror(ioctl_errno));
+            close(fd);
+            return -1;
+        }
     }
     if (ioctl(fd, PERF_EVENT_IOC_ENABLE, 0) != 0) {
         snprintf(error, error_size, "PERF_EVENT_IOC_ENABLE %s/%s cpu %d failed: %s",
                  group_name, event_name, cpu, strerror(errno));
+        if (link_fd >= 0) {
+            close(link_fd);
+            if (link_fd_out) {
+                *link_fd_out = -1;
+            }
+        }
         close(fd);
         return -1;
     }
@@ -1178,6 +1245,16 @@ static bool append_program_fd(EBPFCapture *capture, int fd) {
     return true;
 }
 
+static bool append_link_fd(EBPFCapture *capture, int fd) {
+    int *next = realloc(capture->link_fds, sizeof(int) * (capture->link_fd_count + 1));
+    if (!next) {
+        return false;
+    }
+    capture->link_fds = next;
+    capture->link_fds[capture->link_fd_count++] = fd;
+    return true;
+}
+
 static bool load_and_attach_program(EBPFCapture *capture, const char *group_name, const char *event_name,
                                     int cpu, int prog_fd, char *error, size_t error_size) {
     if (prog_fd < 0 || !append_program_fd(capture, prog_fd)) {
@@ -1186,8 +1263,14 @@ static bool load_and_attach_program(EBPFCapture *capture, const char *group_name
         }
         return false;
     }
-    int tracepoint_fd = open_tracepoint_attachment(group_name, event_name, cpu, prog_fd, error, error_size);
-    if (tracepoint_fd < 0 || !append_tracepoint_fd(capture, tracepoint_fd)) {
+    int link_fd = -1;
+    int tracepoint_fd = open_tracepoint_attachment(group_name, event_name, cpu, prog_fd, &link_fd, error, error_size);
+    if (tracepoint_fd < 0 ||
+        !append_tracepoint_fd(capture, tracepoint_fd) ||
+        (link_fd >= 0 && !append_link_fd(capture, link_fd))) {
+        if (link_fd >= 0) {
+            close(link_fd);
+        }
         if (tracepoint_fd >= 0) {
             close(tracepoint_fd);
         }
@@ -1408,6 +1491,11 @@ static void stop_ebpf_capture(EBPFCapture *capture) {
     if (!capture) {
         return;
     }
+    for (size_t i = 0; i < capture->link_fd_count; ++i) {
+        if (capture->link_fds[i] >= 0) {
+            close(capture->link_fds[i]);
+        }
+    }
     for (size_t i = 0; i < capture->tracepoint_fd_count; ++i) {
         if (capture->tracepoint_fds[i] >= 0) {
             close(capture->tracepoint_fds[i]);
@@ -1431,6 +1519,7 @@ static void stop_ebpf_capture(EBPFCapture *capture) {
     }
     free(capture->prog_fds);
     free(capture->tracepoint_fds);
+    free(capture->link_fds);
     free(capture->rings);
     memset(capture, 0, sizeof(*capture));
     capture->perf_map_fd = -1;

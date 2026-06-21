@@ -2807,7 +2807,14 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
 
     private func machineUnsupportedBodyText() -> String {
         let message = captureStorageStatus?.unsupportedMessage.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let intro = "Firehose cannot capture events on this machine because the Linux kernel does not support the required event tracing features."
+        let isPermissionFailure = message.localizedCaseInsensitiveContains("permission denied") ||
+            message.localizedCaseInsensitiveContains("operation not permitted")
+        let intro: String
+        if isPermissionFailure {
+            intro = "Firehose cannot capture events on this machine because Linux denied access to the required event tracing features."
+        } else {
+            intro = "Firehose cannot capture events on this machine because the Linux kernel does not support the required event tracing features."
+        }
         if message.isEmpty {
             return "\(intro)\n\nRequired feature: Linux eBPF event capture"
         }
@@ -2816,8 +2823,17 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         if message.contains("BPF_MAP_CREATE") {
             details.append("Required feature: eBPF maps / BPF_MAP_CREATE")
         }
+        if message.contains("BPF_LINK_CREATE") {
+            details.append("Required feature: BPF perf-event link attachment / BPF_LINK_CREATE")
+        }
+        if message.contains("PERF_EVENT_IOC_SET_BPF") {
+            details.append("Required feature: perf-event eBPF attachment")
+        }
         if message.contains("Function not implemented") {
             details.append("Kernel response: Function not implemented")
+        }
+        if isPermissionFailure {
+            details.append("Kernel response: Permission denied")
         }
         let detailText = details.isEmpty ? message : details.joined(separator: "\n")
         return "\(intro)\n\nTechnical details:\n\(detailText)"
