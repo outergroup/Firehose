@@ -3840,10 +3840,11 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     private func updateColors() {
         withoutImplicitAnimations {
             appearance?.performAsCurrentDrawingAppearance {
-                rootLayer.backgroundColor = NSColor.windowBackgroundColor.cgColor
-                tableLayer.backgroundColor = NSColor.windowBackgroundColor.cgColor
-                processTimelineLayer.backgroundColor = NSColor.windowBackgroundColor.cgColor
-                toolbarLayer.backgroundColor = NSColor.windowBackgroundColor.cgColor
+                let pageBackgroundColor = NSColor.controlBackgroundColor
+                rootLayer.backgroundColor = pageBackgroundColor.cgColor
+                tableLayer.backgroundColor = pageBackgroundColor.cgColor
+                processTimelineLayer.backgroundColor = pageBackgroundColor.cgColor
+                toolbarLayer.backgroundColor = pageBackgroundColor.cgColor
                 headerLayer.backgroundColor = NSColor.controlBackgroundColor.cgColor
                 let controlBrightness = NSColor.controlBackgroundColor.usingColorSpace(.deviceRGB)?.brightnessComponent ?? 1
                 let isLightTheme = controlBrightness > 0.6
