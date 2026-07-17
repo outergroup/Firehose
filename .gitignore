@@ -19,6 +19,7 @@ DerivedData/
 *.aar
 *.outer
 *.bundle/
+target.env
 
 # Local backend/runtime output
 TraceBackend

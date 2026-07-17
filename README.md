@@ -6,6 +6,23 @@ The backend stores captured events in an append-only temporary binary file, so t
 
 The Linux backend collects process events through eBPF `sched` tracepoints and requires root privileges.
 
+## Deploy Over SSH
+
+With a current Outer Shell installed on the target:
+
+```bash
+./app target "ssh root@server"
+./app deploy
+```
+
+Firehose defaults to a system deployment because its eBPF collector requires
+root. A non-root SSH account can set `OUTER_TARGET_SCOPE=system` in the
+gitignored `target.env`; `./app deploy` will request the administrator password
+when needed. Deployment detects the target architecture and libc and builds
+only the matching dynamic backend. glibc builds use the manylinux2014 (glibc
+2.17) baseline; musl builds use musllinux 1.2. Run `./app build-matrix` to build
+all four Linux release variants, or `./app help` for the other commands.
+
 The current event types are:
 
 - `capture.start`
