@@ -1,0 +1,37 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+  <title>Firehose</title>
+  <link rel="stylesheet" href="/web/app.css">
+</head>
+<body>
+  <main>
+    <header>
+      <div id="summary">Connecting…</div>
+      <div class="header-controls">
+        <button id="capture" type="button" title="Pause or resume" aria-label="Pause capture">Ⅱ</button>
+        <button id="clear" type="button" title="Clear events" aria-label="Clear events">×</button>
+        <input id="filter" placeholder="Filter: All events" aria-label="Filter events">
+      </div>
+    </header>
+    <section class="events" aria-label="Events">
+      <div class="event-head">
+        <span>Time</span>
+        <span>Event</span>
+        <span>PID | Process</span>
+        <span>Path</span>
+        <span>Detail</span>
+      </div>
+      <div id="eventRows"></div>
+    </section>
+    <section class="processes" aria-label="Process activity">
+      <div id="processRows"></div>
+    </section>
+  </main>
+  <div id="contextScrim" hidden></div>
+  <div id="context" role="dialog" aria-label="Event actions" hidden></div>
+  <script src="/web/app.js"></script>
+</body>
+</html>

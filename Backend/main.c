@@ -92,6 +92,7 @@ static const char *kBundleFilePathMacosX86 = "bundles/FirehoseContent.bundle.mac
 
 static char g_bundle_file_path_macos_arm[PATH_MAX] = "";
 static char g_bundle_file_path_macos_x86[PATH_MAX] = "";
+static char g_web_root[PATH_MAX] = "";
 static volatile sig_atomic_t g_shutdown_requested = 0;
 
 typedef struct {
@@ -3280,6 +3281,52 @@ static void send_cached_memory_response(int fd,
     if (send_body && body_length > 0) queue_all(fd, body, body_length);
 }
 
+static bool request_accepts_outerframe(const char *request, size_t request_header_length) {
+    static const char header_name[] = "Outerframe-Accept:";
+    static const char media_type[] = "application/vnd.outerframe";
+    const char *cursor = request, *end = request + request_header_length;
+    while (cursor < end) {
+        const char *line_end = strstr(cursor, "\r\n");
+        if (!line_end || line_end > end) line_end = end;
+        if ((size_t)(line_end - cursor) >= sizeof(header_name) - 1 &&
+            strncasecmp(cursor, header_name, sizeof(header_name) - 1) == 0) {
+            const char *value = cursor + sizeof(header_name) - 1;
+            while (value < line_end && (*value == ' ' || *value == '\t')) value++;
+            return memmem(value, (size_t)(line_end - value), media_type, sizeof(media_type) - 1) != NULL;
+        }
+        cursor = line_end < end ? line_end + 2 : end;
+    }
+    return false;
+}
+
+static void send_web_file(int fd, const char *name, const char *content_type,
+                          const char *request, size_t request_header_length, bool send_body) {
+    char path[PATH_MAX];
+    const char *root = g_web_root[0] ? g_web_root : "web";
+    if (snprintf(path, sizeof(path), "%s/%s", root, name) >= (int)sizeof(path)) {
+        send_text_response(fd, 404, "web asset not found\n"); return;
+    }
+    int file_fd = open(path, O_RDONLY);
+    struct stat st;
+    if (file_fd < 0 || fstat(file_fd, &st) != 0 || st.st_size < 0 || !S_ISREG(st.st_mode)) {
+        if (file_fd >= 0) close(file_fd);
+        send_text_response(fd, 404, "web asset not found\n"); return;
+    }
+    size_t length = (size_t)st.st_size, offset = 0;
+    char *data = malloc(length ? length : 1);
+    if (!data) { close(file_fd); send_text_response(fd, 500, "out of memory\n"); return; }
+    while (offset < length) {
+        ssize_t got = read(file_fd, data + offset, length - offset);
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) break;
+        offset += (size_t)got;
+    }
+    close(file_fd);
+    if (offset != length) { free(data); send_text_response(fd, 500, "failed to read web asset\n"); return; }
+    send_cached_memory_response(fd, request, request_header_length, content_type, data, length, send_body);
+    free(data);
+}
+
 static void send_outer_descriptor(int fd,
                                   const char *request,
                                   size_t request_header_length,
@@ -3647,7 +3694,13 @@ static void handle_client(int fd) {
     }
 
     bool send_body = strcasecmp(method, "HEAD") != 0;
-    if (strcmp(target, "/") == 0 || strcmp(target, "/firehose.outer") == 0) {
+    if (strcmp(target, "/") == 0 && !request_accepts_outerframe(request, request_header_length)) {
+        send_web_file(fd, "index.html", "text/html; charset=utf-8", request, request_header_length, send_body);
+    } else if (strcmp(target, "/web/app.css") == 0) {
+        send_web_file(fd, "app.css", "text/css; charset=utf-8", request, request_header_length, send_body);
+    } else if (strcmp(target, "/web/app.js") == 0) {
+        send_web_file(fd, "app.js", "text/javascript; charset=utf-8", request, request_header_length, send_body);
+    } else if (strcmp(target, "/") == 0 || strcmp(target, "/firehose.outer") == 0) {
         send_outer_descriptor(fd, request, request_header_length, send_body);
     } else if (strcmp(target, kBundleUrlPath) == 0) {
         send_text_response(fd, 200, "macos-arm\nmacos-x86\n");
@@ -3788,7 +3841,7 @@ static bool parse_port(const char *value, int *port_out) {
 }
 
 static void print_usage(const char *program) {
-    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--bundles-dir DIR] [--capture ebpf]\n", program);
+    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--bundles-dir DIR] [--web-root DIR] [--capture ebpf]\n", program);
 }
 
 int main(int argc, char **argv) {
@@ -3819,6 +3872,9 @@ int main(int argc, char **argv) {
                      "%s/FirehoseContent.bundle.macos-arm.aar", dir);
             snprintf(g_bundle_file_path_macos_x86, sizeof(g_bundle_file_path_macos_x86),
                      "%s/FirehoseContent.bundle.macos-x86.aar", dir);
+            snprintf(g_web_root, sizeof(g_web_root), "%s/../web", dir);
+        } else if (strcmp(argv[i], "--web-root") == 0 && i + 1 < argc) {
+            snprintf(g_web_root, sizeof(g_web_root), "%s", argv[++i]);
         } else if (strcmp(argv[i], "--capture") == 0 && i + 1 < argc) {
             const char *capture_mode = argv[++i];
             if (strcmp(capture_mode, "ebpf") != 0) {
