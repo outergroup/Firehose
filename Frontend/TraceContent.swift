@@ -893,6 +893,22 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         case .accessibilityAction(let identifier, let action, let value):
             performAccessibilityAction(identifier, action: action, value: value)
 
+        case .accessibilityActionAndSnapshot(let requestID, let identifier, let action, let value):
+            performAccessibilityAction(identifier, action: action, value: value)
+            outerframeHost.sendAccessibilitySnapshotResponse(requestID: requestID, snapshot: accessibilitySnapshot())
+
+        case .accessibilityTextQuery(let requestID, let identifier, let query, let range, let point):
+            _ = accessibilitySnapshot()
+            let index = filterClauses.indices.first { accessibilityIDs["filter/\(filterClauses[$0].accessibilityID)/value"] == identifier }
+            let result: OuterframeAccessibilityTextResult?
+            if isFilterPanelExpanded, let index, index < filterValueLayers.count {
+                let layer = filterValueLayers[index]
+                let text = filterClauses[index].value
+                result = accessibilitySingleLineQuery(query, range: range, point: point, text: text,
+                    line: makeFilterValueLine(for: text), frame: rootLayer.convert(layer.bounds, from: layer))
+            } else { result = nil }
+            outerframeHost.sendAccessibilityTextResponse(requestID: requestID, result: result)
+
         case .accessibilitySnapshotRequest(let requestID):
             outerframeHost.sendAccessibilitySnapshotResponse(requestID: requestID,
                                                              snapshot: accessibilitySnapshot())
@@ -4039,13 +4055,15 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                         value: String? = nil, children: [OuterframeAccessibilityNode] = [], enabled: Bool = true,
                         actions: OuterframeAccessibilityActions = [], selected: Bool = false, focused: Bool = false,
                         rowIndex: Int? = nil, columnIndex: Int? = nil, rowCount: Int? = nil, columnCount: Int? = nil,
+                        selection: NSRange? = nil,
                         handler: ((TraceHandler, OuterframeAccessibilityAction, String) -> Void)? = nil) -> OuterframeAccessibilityNode {
         let id: UInt32
         if let existing = accessibilityIDs[key] { id = existing }
         else { id = nextAccessibilityID; nextAccessibilityID += 1; accessibilityIDs[key] = id }
         let node = OuterframeAccessibilityNode(identifier: id, role: role, frame: frame, label: label, value: value,
             children: children, rowCount: rowCount, columnCount: columnCount, isEnabled: enabled, actions: actions,
-            isFocused: focused, isSelected: selected, rowIndex: rowIndex, columnIndex: columnIndex)
+            isFocused: focused, isSelected: selected, rowIndex: rowIndex, columnIndex: columnIndex, selectedTextRange: selection,
+            supportsTextGeometry: role == .textField, supportsActionSnapshot: true)
         accessibilityNodes[id] = node
         accessibilityActions[id] = handler
         return node
@@ -4077,11 +4095,28 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                     actions: [.press]) { owner, _, _ in owner.activeFilterIndex = index; owner.cycleFilterColumn(at: index) }
                 let operation = axNode(key + "/operation", role: .button, frame: frame(filterOperationLayers[index]), label: "Filter operation", value: clause.operation.title,
                     actions: [.press]) { owner, _, _ in owner.activeFilterIndex = index; owner.cycleFilterOperation(at: index) }
+                let selection: NSRange?
+                if activeFilterIndex == index && filterInputController.isFocused {
+                    let selected = filterInputController.selectionRange ?? filterInputController.cursorPosition..<filterInputController.cursorPosition
+                    let start = utf16Offset(forCharacterIndex: selected.lowerBound, in: clause.value)
+                    selection = NSRange(location: start, length: utf16Offset(forCharacterIndex: selected.upperBound, in: clause.value) - start)
+                } else { selection = nil }
                 let value = axNode(key + "/value", role: .textField, frame: frame(filterValueLayers[index]), label: "Filter value", value: clause.value,
-                    actions: [.focus, .setValue], focused: activeFilterIndex == index && filterInputController.isFocused) { owner, action, value in
+                    actions: [.focus, .setValue, .setSelectedTextRange], focused: activeFilterIndex == index && filterInputController.isFocused, selection: selection) { owner, action, value in
                         owner.activeFilterIndex = index
                         owner.syncFilterInputToActiveClause(moveCursorToEnd: true)
                         if action == .setValue { owner.filterInputController.setText(value); owner.applyFilterChange() }
+                        if action == .setSelectedTextRange {
+                            let parts = value.split(separator: ":", omittingEmptySubsequences: false)
+                            let text = owner.filterInputController.text
+                            guard parts.count == 2, let location = Int(parts[0]), let length = Int(parts[1]),
+                                  OuterframeAccessibilityTextRange.isValid(NSRange(location: location, length: length), in: text),
+                                  let selection = Range(NSRange(location: location, length: length), in: text),
+                                  (text.indices.contains(selection.lowerBound) || selection.lowerBound == text.endIndex),
+                                  (text.indices.contains(selection.upperBound) || selection.upperBound == text.endIndex) else { return }
+                            owner.filterInputController.setCursorPosition(text.distance(from: text.startIndex, to: selection.lowerBound), modifySelection: false)
+                            owner.filterInputController.setCursorPosition(text.distance(from: text.startIndex, to: selection.upperBound), modifySelection: true)
+                        }
                         owner.updateFilterText(); owner.updateTextInputState()
                     }
                 let remove = axNode(key + "/remove", role: .button, frame: frame(filterRemoveLayers[index]), label: "Remove filter", actions: [.press]) { owner, _, _ in owner.removeFilterClause(at: index) }
@@ -4155,5 +4190,43 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             accessibilityNotificationScheduled = false
             outerframeHost.notifyAccessibilityTreeChanged(.layoutChanged)
         }
+    }
+}
+
+private func accessibilitySingleLineQuery(_ query: OuterframeAccessibilityTextQuery, range: NSRange,
+                                           point: CGPoint, text: String, line: CTLine,
+                                           frame: CGRect) -> OuterframeAccessibilityTextResult? {
+    let count = text.utf16.count
+    switch query {
+    case .lineForIndex:
+        guard OuterframeAccessibilityTextRange.isValid(NSRange(location: range.location, length: 0), in: text) else { return nil }
+        return OuterframeAccessibilityTextResult(index: 0)
+    case .rangeForLine:
+        guard range.location == 0 else { return nil }
+        return OuterframeAccessibilityTextResult(range: NSRange(location: 0, length: count))
+    case .visibleRange:
+        let hit = CTLineGetStringIndexForPosition(line, CGPoint(x: frame.width, y: 0))
+        let end = hit == kCFNotFound ? count : min(max(hit, 0), count)
+        let boundary = end < count ? (text as NSString).rangeOfComposedCharacterSequence(at: end).location : count
+        return OuterframeAccessibilityTextResult(range: NSRange(location: 0, length: boundary))
+    case .frameForRange:
+        guard OuterframeAccessibilityTextRange.isValid(range, in: text) else { return nil }
+        let a = CTLineGetOffsetForStringIndex(line, range.location, nil)
+        let b = CTLineGetOffsetForStringIndex(line, NSMaxRange(range), nil)
+        return OuterframeAccessibilityTextResult(range: range,
+            frame: CGRect(x: frame.minX + min(a, b), y: frame.minY, width: max(abs(b - a), 1), height: frame.height))
+    case .rangeForPosition:
+        guard frame.contains(point) else { return nil }
+        let x = point.x - frame.minX
+        let string = text as NSString
+        var offset = 0
+        while offset < count {
+            let cluster = string.rangeOfComposedCharacterSequence(at: offset)
+            let a = CTLineGetOffsetForStringIndex(line, cluster.location, nil)
+            let b = CTLineGetOffsetForStringIndex(line, NSMaxRange(cluster), nil)
+            if x >= min(a, b), x < max(a, b) { return OuterframeAccessibilityTextResult(range: cluster) }
+            offset = NSMaxRange(cluster)
+        }
+        return OuterframeAccessibilityTextResult(range: NSRange(location: x <= 0 ? 0 : count, length: 0))
     }
 }
