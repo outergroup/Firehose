@@ -65,6 +65,10 @@ package_linux_variant() {
     install -m 0644 "${PACKAGE_ROOT}/bundles/FirehoseContent.bundle.macos-arm.aar" "${app_root}/bundles/FirehoseContent.bundle.macos-arm.aar"
     install -m 0644 "${PACKAGE_ROOT}/bundles/FirehoseContent.bundle.macos-x86.aar" "${app_root}/bundles/FirehoseContent.bundle.macos-x86.aar"
     install -m 0644 "${REPO_ROOT}/app-icon.png" "${app_root}/app-icon.png"
+    mkdir -p "${app_root}/web"
+    install -m 0644 "${REPO_ROOT}/Resources/FirehoseWeb/index.html" "${app_root}/web/index.html"
+    install -m 0644 "${REPO_ROOT}/Resources/FirehoseWeb/app.css" "${app_root}/web/app.css"
+    install -m 0644 "${REPO_ROOT}/Resources/FirehoseWeb/app.js" "${app_root}/web/app.js"
     tar --format ustar --no-xattrs -C "${STAGING_ROOT}" -czf "${OUTPUT_APP_ROOT}/${output_name}.tar.gz" Firehose
     echo "Packaged ${OUTPUT_APP_ROOT}/${output_name}.tar.gz"
 }
