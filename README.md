@@ -82,3 +82,5 @@ On Linux with cgroup v2, Firehose captures the emitting task's cgroup ID in each
 Discovery refreshes every five seconds. Events from cgroups not yet discovered are explicitly labeled unresolved, rather than attributed to the host. The collector runs on the Linux host; containers inside a different VM/kernel are not supported by this path. No container helper or additional container privileges are installed.
 
 Run `python3 Scripts/test_container_events.py` for sanitizer-backed fork-path copying, event identity, binary encoding, and filtering checks.
+
+Linux capture uses task IDs consistently for fork, syscall, and exit events, while the timeline groups those events by the owning process ID (TGID). Worker-thread lifecycle events do not create separate process rows or end the owning process. Fork names are read at capture time from either fixed-length or `__data_loc` tracepoint fields, including for children that exit before userspace consumes the event. `Scripts/test_linux_task_capture.py /absolute/path/to/FirehoseBackend` tests this using a separate backend instance and requires root on Linux.

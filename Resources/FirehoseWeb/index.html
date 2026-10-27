@@ -12,8 +12,8 @@
     <header>
       <div id="summary">Connecting…</div>
       <div class="header-controls">
-        <button id="capture" type="button" title="Pause or resume" aria-label="Pause capture">Ⅱ</button>
-        <button id="clear" type="button" title="Clear events" aria-label="Clear events">×</button>
+        <button id="capture" type="button" title="Pause or resume" aria-label="Pause capture"><svg viewBox="0 0 16 16" aria-hidden="true"><path class="pause-icon" d="M5 4v8M11 4v8" fill="none" stroke="currentColor" stroke-width="2"/><path class="play-icon" d="M5 3l8 5-8 5z" fill="currentColor"/></svg></button>
+        <button id="clear" type="button" title="Clear events" aria-label="Clear events"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></button>
         <select id="container" aria-label="Container"><option value="">All containers and host</option><option value="host">Host</option></select>
         <input id="filter" placeholder="Filter: All events" aria-label="Filter events">
       </div>
@@ -22,21 +22,20 @@
       <div class="event-head">
         <span>Time</span>
         <span>Event</span>
-        <span>PID | Process</span>
-        <span>Path</span>
-        <span>Detail</span>
+        <span class="event-pid">PID</span>
+        <span>Process</span>
+        <span class="event-tid">TID</span>
+        <span class="event-thread">Thread</span>
+        <span class="event-path">Path</span>
+        <span class="event-detail">Detail</span>
       </div>
-      <nav class="event-navigation" aria-label="Event history">
-        <button id="oldest" type="button">Oldest</button>
-        <button id="older" type="button">Older</button>
-        <span id="eventRange" aria-live="off">Loading…</span>
-        <button id="newer" type="button">Newer</button>
-        <button id="live" type="button" aria-pressed="true">Live</button>
-      </nav>
-      <div id="eventRows" tabindex="0" aria-label="Scrollable event history"><div id="eventExtent"><div id="eventWindow"></div></div></div>
+      <div class="event-viewport">
+        <div id="eventRows" tabindex="0" aria-label="Scrollable event history"><div id="eventExtent"><div id="eventWindow"></div></div></div>
+        <div id="eventScrollbar" role="scrollbar" tabindex="0" aria-label="Event history position" aria-controls="eventRows" aria-orientation="vertical" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0"><div id="eventThumb"></div></div>
+      </div>
     </section>
-    <section class="processes" aria-label="Process activity">
-      <div id="processRows"></div>
+    <section class="processes" tabindex="0" aria-label="Process activity">
+      <div id="processExtent"><div id="processRows"></div></div>
     </section>
   </main>
   <div id="contextScrim" hidden></div>

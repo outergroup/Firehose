@@ -9,7 +9,8 @@ with tempfile.TemporaryDirectory() as temporary:
     def text(offset):
         start,size=struct.unpack_from('<II',b,offset);assert start+size<=len(b);return b[start:start+size].decode()
     assert struct.unpack_from('<I',b,24)[0]==1
-    assert struct.unpack_from('<I',b,28)[0]==88
+    assert struct.unpack_from('<I',b,28)[0]==104
+    assert struct.unpack_from('<I',b,72+88)[0]==120 and text(72+96)=='owner'
     assert text(72+64)=='Test café' and text(72+72)=='test-container'
     assert struct.unpack_from('<Q',b,72+80)[0]==456
     print('PASS binary event container identity and cgroup ID')

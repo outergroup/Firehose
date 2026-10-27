@@ -17,13 +17,13 @@ for (const matched of [0, 10, 10000, 100000000]) {
     history.live = false;
     const query = history.query(offset, height);
     assert.equal(query.get('tail'), 'false');
-    assert.equal(Number(query.get('start')), Math.max(0, Math.floor(offset / 31) - 32));
+    assert.equal(Number(query.get('start')), Math.max(0, Math.floor(offset / 26) - 32));
     assert(Number(query.get('count')) < 100);
   }
 }
 history.live = false;
 history.accept({matched:10000,total:10000,start:4968,events:[{id:4969}]});
-const oldOffset = 5000 * 31;
+const oldOffset = 5000 * 26;
 const oldExtent = history.geometry(400).extent;
 history.accept({matched:10000,total:10000,start:7000,events:[{id:7001}]});
 assert.equal(history.geometry(400).extent, oldExtent);
@@ -34,3 +34,15 @@ assert(history.accept({matched:0,total:0,start:0,events:[]}));
 assert.equal(history.live, true);
 assert.equal(history.query(0,400).get('tail'), 'true');
 console.log('PASS full-history extent, arbitrary seek, bounded windows, large captures, stable position on growth, clear reset');
+
+vm.runInContext(source.slice(source.indexOf('  function processWindow('), source.indexOf('  let processTotal')), context);
+for (const total of [0, 10, 5000, 100000000]) {
+  const first = context.processWindow(0, 241, total);
+  const last = context.processWindow(first.physical, 241, total);
+  assert(first.extent <= 8000000);
+  assert.equal(first.start, 0);
+  assert(last.start + last.count >= total);
+  assert(last.count < 100);
+  assert.equal(last.offset, last.logical);
+}
+console.log('PASS process timeline spans the entire capture with bounded render windows');

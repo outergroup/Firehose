@@ -47,7 +47,7 @@
 #define EVENT_BINARY_MAGIC 0x45435254u
 #define EVENT_BINARY_VERSION 4
 #define EVENT_BINARY_HEADER_SIZE 72
-#define EVENT_BINARY_RECORD_SIZE 88
+#define EVENT_BINARY_RECORD_SIZE 104
 #define EVENT_BINARY_MAX_COUNT 512
 #define PROCESS_TIMELINE_BINARY_MAGIC 0x50435254u
 #define PROCESS_TIMELINE_BINARY_VERSION 5
@@ -101,6 +101,8 @@ typedef struct {
     int ppid;
     char name[PROCESS_NAME_LEN];
     uint64_t cgroup_id;
+    int tgid;
+    char group_name[PROCESS_NAME_LEN];
 } ProcessInfo;
 
 typedef struct {
@@ -130,6 +132,8 @@ typedef struct {
     char detail[256];
     ContainerContext container;
     uint64_t cgroup_id;
+    int tgid;
+    char group_name[PROCESS_NAME_LEN];
 } TraceEvent;
 
 typedef struct {
@@ -559,49 +563,7 @@ static bool capture_process_snapshot(ProcessSnapshot *snapshot) {
     return true;
 }
 
-static TRACE_UNUSED int normalize_process_parent_pid(int ppid) {
-    return ppid;
-}
 #else
-static bool read_linux_process_tgid(int pid, int *tgid_out) {
-    char path[PATH_MAX];
-    snprintf(path, sizeof(path), "/proc/%d/status", pid);
-
-    FILE *file = fopen(path, "r");
-    if (!file) {
-        return false;
-    }
-
-    char line[256];
-    bool found = false;
-    while (fgets(line, sizeof(line), file)) {
-        if (strncmp(line, "Tgid:", 5) != 0) {
-            continue;
-        }
-        char *value = line + 5;
-        while (*value && isspace((unsigned char)*value)) {
-            value++;
-        }
-        char *end = NULL;
-        long tgid = strtol(value, &end, 10);
-        if (tgid > 0 && tgid <= INT_MAX) {
-            *tgid_out = (int)tgid;
-            found = true;
-        }
-        break;
-    }
-    fclose(file);
-    return found;
-}
-
-static TRACE_UNUSED int normalize_process_parent_pid(int ppid) {
-    if (ppid <= 0) {
-        return ppid;
-    }
-    int tgid = 0;
-    return read_linux_process_tgid(ppid, &tgid) ? tgid : ppid;
-}
-
 static bool read_linux_cmdline_process_name(int pid, char *out, size_t out_size) {
     if (pid <= 0 || !out || out_size == 0) {
         return false;
@@ -928,7 +890,7 @@ static void append_perf_submit(struct bpf_insn *insns, size_t *count, int map_fd
 
 static int load_fork_bpf_program(int map_fd, int output_cpu, ForkTracepointOffsets offsets,
                                  char *error, size_t error_size) {
-    struct bpf_insn insns[64];
+    struct bpf_insn insns[96];
     size_t count = 0;
 
     insns[count++] = TRACE_BPF_MOV64_REG(BPF_REG_6, BPF_REG_1);
@@ -941,7 +903,15 @@ static int load_fork_bpf_program(int map_fd, int output_cpu, ForkTracepointOffse
     insns[count++] = TRACE_BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_2, TRACE_BPF_STACK_OFF + 20);
     insns[count++] = TRACE_BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_6, offsets.parent_pid);
     insns[count++] = TRACE_BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_2, TRACE_BPF_STACK_OFF + 16);
-    if (!offsets.child_comm_is_data_loc) {
+    if (offsets.child_comm_is_data_loc) {
+        insns[count++] = TRACE_BPF_LDX_MEM(BPF_W, BPF_REG_3, BPF_REG_6, offsets.child_comm);
+        insns[count++] = TRACE_BPF_ALU64_IMM(BPF_AND, BPF_REG_3, 0xffff);
+        insns[count++] = TRACE_BPF_ALU64_REG(BPF_ADD, BPF_REG_3, BPF_REG_6);
+        insns[count++] = TRACE_BPF_MOV64_REG(BPF_REG_1, BPF_REG_10);
+        insns[count++] = TRACE_BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, TRACE_BPF_STACK_OFF + 40);
+        insns[count++] = TRACE_BPF_MOV64_IMM(BPF_REG_2, 16);
+        insns[count++] = TRACE_BPF_EMIT_CALL(BPF_FUNC_probe_read_kernel_str);
+    } else {
         for (int i = 0; i < 16; i += 4) {
             insns[count++] = TRACE_BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_6, offsets.child_comm + i);
             insns[count++] = TRACE_BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_2, TRACE_BPF_STACK_OFF + 40 + i);
@@ -963,8 +933,9 @@ static int load_exit_bpf_program(int map_fd, int output_cpu, char *error, size_t
     insns[count++] = TRACE_BPF_ST_MEM(BPF_W, BPF_REG_10, TRACE_BPF_STACK_OFF + 8, TRACE_BPF_EVENT_EXIT);
     insns[count++] = TRACE_BPF_EMIT_CALL(BPF_FUNC_get_current_pid_tgid);
     insns[count++] = TRACE_BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_0, TRACE_BPF_STACK_OFF + 20);
-    insns[count++] = TRACE_BPF_ALU64_IMM(BPF_RSH, BPF_REG_0, 32);
     insns[count++] = TRACE_BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_0, TRACE_BPF_STACK_OFF + 12);
+    insns[count++] = TRACE_BPF_ALU64_IMM(BPF_RSH, BPF_REG_0, 32);
+    insns[count++] = TRACE_BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_0, TRACE_BPF_STACK_OFF + 16);
     insns[count++] = TRACE_BPF_MOV64_REG(BPF_REG_1, BPF_REG_10);
     insns[count++] = TRACE_BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, TRACE_BPF_STACK_OFF + 40);
     insns[count++] = TRACE_BPF_MOV64_IMM(BPF_REG_2, 16);
@@ -987,8 +958,9 @@ static int load_syscall_bpf_program(int map_fd, int output_cpu, uint32_t event_t
     insns[count++] = TRACE_BPF_ST_MEM(BPF_W, BPF_REG_10, TRACE_BPF_STACK_OFF + 8, (int32_t)event_type);
     insns[count++] = TRACE_BPF_EMIT_CALL(BPF_FUNC_get_current_pid_tgid);
     insns[count++] = TRACE_BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_0, TRACE_BPF_STACK_OFF + 20);
-    insns[count++] = TRACE_BPF_ALU64_IMM(BPF_RSH, BPF_REG_0, 32);
     insns[count++] = TRACE_BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_0, TRACE_BPF_STACK_OFF + 12);
+    insns[count++] = TRACE_BPF_ALU64_IMM(BPF_RSH, BPF_REG_0, 32);
+    insns[count++] = TRACE_BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_0, TRACE_BPF_STACK_OFF + 16);
     insns[count++] = TRACE_BPF_MOV64_REG(BPF_REG_1, BPF_REG_10);
     insns[count++] = TRACE_BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, TRACE_BPF_STACK_OFF + 40);
     insns[count++] = TRACE_BPF_MOV64_IMM(BPF_REG_2, 16);
@@ -1303,6 +1275,65 @@ static void copy_from_perf_ring(void *destination, const char *data, size_t data
     }
 }
 
+typedef struct { int tid; size_t index; } PendingForkGroup;
+static PendingForkGroup *g_pending_fork_groups;
+static size_t g_pending_fork_group_count;
+static struct { int pid; char name[PROCESS_NAME_LEN]; } g_group_names[4096];
+static struct { int tid; int tgid; uint64_t timestamp; } g_recent_task_groups[8192];
+
+static int read_task_group(int tid) {
+    char path[64], line[256];
+    snprintf(path, sizeof(path), "/proc/%d/status", tid);
+    FILE *file = fopen(path, "r");
+    if (!file) return 0;
+    int tgid = 0;
+    while (fgets(line, sizeof(line), file)) if (sscanf(line, "Tgid: %d", &tgid) == 1) break;
+    fclose(file);
+    return tgid;
+}
+
+static void resolve_group_name(ProcessInfo *process) {
+    if (process->tgid <= 0) return;
+    size_t slot = (unsigned)process->tgid % 4096;
+    if (process->pid == process->tgid) {
+        g_group_names[slot].pid = process->tgid;
+        snprintf(g_group_names[slot].name, PROCESS_NAME_LEN, "%s", process->name);
+    } else if (g_group_names[slot].pid != process->tgid) {
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/%d/comm", process->tgid);
+        FILE *file = fopen(path, "r");
+        if (file) {
+            if (fgets(g_group_names[slot].name, PROCESS_NAME_LEN, file)) {
+                g_group_names[slot].name[strcspn(g_group_names[slot].name, "\n")] = 0;
+                g_group_names[slot].pid = process->tgid;
+            }
+            fclose(file);
+        }
+    }
+    if (g_group_names[slot].pid == process->tgid) snprintf(process->group_name, PROCESS_NAME_LEN, "%s", g_group_names[slot].name);
+    else snprintf(process->group_name, PROCESS_NAME_LEN, "pid-%d", process->tgid);
+}
+
+static void resolve_pending_fork_group(const ProcessInfo *process) {
+    for (size_t i = 0; i < g_pending_fork_group_count; ) {
+        PendingForkGroup pending = g_pending_fork_groups[i];
+        if (pending.tid != process->pid) { i++; continue; }
+        TraceEvent event;
+        off_t offset = (off_t)pending.index * sizeof(event);
+        if (pread(g_events.fd, &event, sizeof(event), offset) == sizeof(event) && event.pid == process->pid) {
+            event.tgid = process->tgid;
+            snprintf(event.group_name, sizeof(event.group_name), "%s", process->group_name);
+            if (pwrite(g_events.fd, &event, sizeof(event), offset) != sizeof(event)) {
+                fprintf(stderr, "FirehoseBackend failed to resolve fork group: %s\n", strerror(errno));
+            } else {
+                clear_process_timeline_snapshot(&g_unfiltered_process_timeline);
+                clear_filtered_process_timeline_cache();
+            }
+        }
+        g_pending_fork_groups[i] = g_pending_fork_groups[--g_pending_fork_group_count];
+    }
+}
+
 static void consume_perf_ring(PerfRing *ring) {
     if (ring->fd < 0 || !ring->mapping) {
         return;
@@ -1336,6 +1367,7 @@ static void consume_perf_ring(PerfRing *ring) {
                 ProcessInfo process = {
                     .pid = bpf_event.pid,
                     .ppid = bpf_event.ppid,
+                    .tgid = bpf_event.event_type == TRACE_BPF_EVENT_FORK ? read_task_group(bpf_event.pid) : bpf_event.ppid,
                     .cgroup_id = bpf_event.cgroup_id
                 };
                 snprintf(process.name, sizeof(process.name), "%.*s", (int)sizeof(bpf_event.comm), bpf_event.comm);
@@ -1346,14 +1378,33 @@ static void consume_perf_ring(PerfRing *ring) {
                     snprintf(process.name, sizeof(process.name), "pid-%d", process.pid);
                 }
 
+                size_t group_slot = (unsigned)process.pid % 8192;
+                if (!process.tgid && g_recent_task_groups[group_slot].tid == process.pid &&
+                    g_recent_task_groups[group_slot].timestamp >= bpf_event.timestamp_ns) {
+                    process.tgid = g_recent_task_groups[group_slot].tgid;
+                }
+                if (process.tgid > 0) {
+                    g_recent_task_groups[group_slot].tid = process.pid;
+                    g_recent_task_groups[group_slot].tgid = process.tgid;
+                    g_recent_task_groups[group_slot].timestamp = bpf_event.timestamp_ns;
+                }
+                resolve_group_name(&process);
+                if (process.tgid > 0) resolve_pending_fork_group(&process);
                 char detail[256];
                 char event_path[EVENT_PATH_LEN] = "";
                 if (bpf_event.event_type == TRACE_BPF_EVENT_FORK) {
-                    process.ppid = normalize_process_parent_pid(process.ppid);
                     process_parent_set(process.pid, process.ppid);
                     fd_path_copy_pid(process.ppid, process.pid);
                     snprintf(detail, sizeof(detail), "Forked from parent pid %d", process.ppid);
+                    size_t index = g_events.count;
                     add_event("process.fork", &process, "", detail);
+                    if (!process.tgid && g_events.count > index) {
+                        PendingForkGroup *next = realloc(g_pending_fork_groups, (g_pending_fork_group_count + 1) * sizeof(*next));
+                        if (next) {
+                            g_pending_fork_groups = next;
+                            next[g_pending_fork_group_count++] = (PendingForkGroup){process.pid, index};
+                        } else fprintf(stderr, "FirehoseBackend could not retain pending fork group\n");
+                    }
                 } else if (bpf_event.event_type == TRACE_BPF_EVENT_EXIT) {
                     process.ppid = process_parent_lookup(process.pid);
                     pending_open_remove_pid(process.pid);
@@ -1773,6 +1824,11 @@ static bool event_store_clear(EventStore *store) {
     if (lseek(store->fd, 0, SEEK_SET) < 0) {
         return false;
     }
+#ifdef __linux__
+    free(g_pending_fork_groups);
+    g_pending_fork_groups = NULL;
+    g_pending_fork_group_count = 0;
+#endif
     store->count = 0;
     store->next_id = 0;
     store->reported_recursive_write_ignore = false;
@@ -1850,6 +1906,12 @@ static void add_event(const char *type, const ProcessInfo *process, const char *
     event.timestamp = current_time_seconds();
     event.pid = process ? process->pid : 0;
     event.ppid = process ? process->ppid : 0;
+    event.tgid = process ? process->tgid : 0;
+    if (process) snprintf(event.group_name, sizeof(event.group_name), "%s", process->group_name);
+#ifndef __linux__
+    event.tgid = event.pid;
+    if (process) snprintf(event.group_name, sizeof(event.group_name), "%s", process->name);
+#endif
     event.container = container_host();
     event.cgroup_id = process ? process->cgroup_id : 0;
 #ifdef __linux__
@@ -1863,16 +1925,17 @@ static void add_event(const char *type, const ProcessInfo *process, const char *
     size_t event_index = g_events.count;
     if (write_all_fd(g_events.fd, &event, sizeof(event))) {
         g_events.count++;
-        note_process_timeline_source_event(&g_unfiltered_process_timeline, &event, event_index);
-        if (!append_event_to_process_timeline_snapshot(&g_unfiltered_process_timeline,
-                                                       &event,
-                                                       (uint64_t)event_index)) {
-            fprintf(stderr, "FirehoseBackend failed to update process timeline index: %s\n", strerror(errno));
-            clear_process_timeline_snapshot(&g_unfiltered_process_timeline);
-        } else {
-            g_unfiltered_process_timeline.filtered_event_count = (uint64_t)g_events.count;
+        if (g_unfiltered_process_timeline.source_event_count == event_index) {
+            note_process_timeline_source_event(&g_unfiltered_process_timeline, &event, event_index);
+            if (!append_event_to_process_timeline_snapshot(&g_unfiltered_process_timeline,
+                                                           &event,
+                                                           (uint64_t)event_index)) {
+                fprintf(stderr, "FirehoseBackend failed to update process timeline index: %s\n", strerror(errno));
+                clear_process_timeline_snapshot(&g_unfiltered_process_timeline);
+            } else {
+                g_unfiltered_process_timeline.filtered_event_count = (uint64_t)g_events.count;
+            }
         }
-
         if (g_filtered_process_timeline_cache.valid) {
             ProcessTimelineSnapshot *snapshot = &g_filtered_process_timeline_cache.snapshot;
             note_process_timeline_source_event(snapshot, &event, event_index);
@@ -2202,6 +2265,7 @@ static const char *event_value_for_filter_column(const TraceEvent *event,
                                                  const char *column,
                                                  char *scratch,
                                                  size_t scratch_size) {
+    if (strcmp(column, "owner") == 0) return event->group_name;
     if (strcmp(column, "container") == 0) return event->container.id;
     if (strcmp(column, "event") == 0) {
         return event->type;
@@ -2392,6 +2456,8 @@ static bool is_process_exit_event(const TraceEvent *event) {
 static bool is_known_process_name(const char *process) {
     return process &&
            process[0] != '\0' &&
+           !(strncmp(process, "pid-", 4) == 0 && process[4] &&
+             strspn(process + 4, "0123456789") == strlen(process + 4)) &&
            strcmp(process, "unknown") != 0 &&
            strcmp(process, "firehose") != 0 &&
            strcmp(process, "FirehoseBackend") != 0;
@@ -2445,6 +2511,21 @@ static bool append_event_to_process_timeline_snapshot(ProcessTimelineSnapshot *s
     if (event->pid <= 0) {
         return true;
     }
+    TraceEvent grouped;
+    if (event->tgid > 0) {
+        grouped = *event;
+        grouped.pid = event->tgid;
+        if (event->group_name[0]) snprintf(grouped.process, sizeof(grouped.process), "%s", event->group_name);
+        if (event->pid != event->tgid) {
+            grouped.ppid = 0;
+            if (strcmp(grouped.type, "process.fork") == 0) snprintf(grouped.type, sizeof(grouped.type), "thread.fork");
+            if (strcmp(grouped.type, "process.exit") == 0) snprintf(grouped.type, sizeof(grouped.type), "thread.exit");
+        }
+        event = &grouped;
+    }
+#ifdef __linux__
+    else if (strcmp(event->type, "process.fork") == 0) return true;
+#endif
 
     if (strcmp(event->type, "process.fork") == 0 && event->ppid > 0) {
         if (!ensure_process_timeline_parent_item(&snapshot->timeline, event)) {
@@ -2978,6 +3059,7 @@ static size_t build_events_binary(size_t start, size_t count, bool tail, const E
         variable_size += strlen(events[i].path);
         variable_size += strlen(events[i].detail);
         variable_size += strlen(events[i].container.name) + strlen(events[i].container.id);
+        variable_size += strlen(events[i].group_name);
     }
     if (fixed_size > SIZE_MAX - variable_size) {
         return 0;
@@ -3015,13 +3097,15 @@ static size_t build_events_binary(size_t start, size_t count, bool tail, const E
         write_uint32_le(buffer + record_offset + 16, (uint32_t)event->pid);
         write_uint32_le(buffer + record_offset + 20, (uint32_t)event->ppid);
         write_uint64_le(buffer + record_offset + 80, event->cgroup_id);
+        write_uint32_le(buffer + record_offset + 88, (uint32_t)event->tgid);
         if (!append_string_ref(buffer, total_size, &variable_offset, record_offset + 24, time_buffer) ||
             !append_string_ref(buffer, total_size, &variable_offset, record_offset + 32, event->type) ||
             !append_string_ref(buffer, total_size, &variable_offset, record_offset + 40, event->process) ||
             !append_string_ref(buffer, total_size, &variable_offset, record_offset + 48, event->detail) ||
             !append_string_ref(buffer, total_size, &variable_offset, record_offset + 56, event->path) ||
             !append_string_ref(buffer, total_size, &variable_offset, record_offset + 64, event->container.name) ||
-            !append_string_ref(buffer, total_size, &variable_offset, record_offset + 72, event->container.id)) {
+            !append_string_ref(buffer, total_size, &variable_offset, record_offset + 72, event->container.id) ||
+            !append_string_ref(buffer, total_size, &variable_offset, record_offset + 96, event->group_name)) {
             free(buffer);
             return 0;
         }
