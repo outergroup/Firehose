@@ -26,6 +26,7 @@
 #include <unistd.h>
 
 #include "HTTPCache.h"
+#include "ContainerContext.h"
 
 #ifdef __APPLE__
 #include <sys/sysctl.h>
@@ -46,7 +47,7 @@
 #define EVENT_BINARY_MAGIC 0x45435254u
 #define EVENT_BINARY_VERSION 4
 #define EVENT_BINARY_HEADER_SIZE 72
-#define EVENT_BINARY_RECORD_SIZE 64
+#define EVENT_BINARY_RECORD_SIZE 88
 #define EVENT_BINARY_MAX_COUNT 512
 #define PROCESS_TIMELINE_BINARY_MAGIC 0x50435254u
 #define PROCESS_TIMELINE_BINARY_VERSION 5
@@ -99,6 +100,7 @@ typedef struct {
     int pid;
     int ppid;
     char name[PROCESS_NAME_LEN];
+    uint64_t cgroup_id;
 } ProcessInfo;
 
 typedef struct {
@@ -126,6 +128,8 @@ typedef struct {
     char process[PROCESS_NAME_LEN];
     char path[EVENT_PATH_LEN];
     char detail[256];
+    ContainerContext container;
+    uint64_t cgroup_id;
 } TraceEvent;
 
 typedef struct {
@@ -410,7 +414,8 @@ static TRACE_UNUSED void fd_path_copy_pid(int parent_pid, int child_pid) {
     size_t original_count = g_fd_paths.count;
     for (size_t i = 0; i < original_count; ++i) {
         if (g_fd_paths.items[i].pid == parent_pid) {
-            fd_path_set(child_pid, g_fd_paths.items[i].fd, g_fd_paths.items[i].path);
+            FdPathEntry source = g_fd_paths.items[i];
+            fd_path_set(child_pid, source.fd, source.path);
         }
     }
 }
@@ -741,7 +746,7 @@ static bool resolve_linux_cmdline_process_name_once(int pid, const char *comm, c
 #define TRACE_BPF_EVENT_WRITE 8
 #define TRACE_BPF_EVENT_OPENAT_RET 9
 #define TRACE_BPF_EVENT_OPENAT2_RET 10
-#define TRACE_BPF_EVENT_SIZE 184
+#define TRACE_BPF_EVENT_SIZE 192
 #define TRACE_BPF_STACK_OFF (-192)
 #define TRACE_BPF_FORK_PARENT_PID_OFFSET 24
 #define TRACE_BPF_FORK_CHILD_COMM_OFFSET 28
@@ -760,6 +765,7 @@ typedef struct {
     uint64_t arg1;
     char comm[16];
     char text[TRACE_BPF_TEXT_LEN];
+    uint64_t cgroup_id;
 } BPFKernelEvent;
 
 typedef struct {
@@ -898,6 +904,8 @@ static void append_zero_event_stack(struct bpf_insn *insns, size_t *count) {
     for (int offset = 0; offset < TRACE_BPF_EVENT_SIZE; offset += 8) {
         insns[(*count)++] = TRACE_BPF_ST_MEM(BPF_DW, BPF_REG_10, TRACE_BPF_STACK_OFF + offset, 0);
     }
+    insns[(*count)++] = TRACE_BPF_EMIT_CALL(BPF_FUNC_get_current_cgroup_id);
+    insns[(*count)++] = TRACE_BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_0, TRACE_BPF_STACK_OFF + 184);
 }
 
 static void append_ld_map_fd(struct bpf_insn *insns, size_t *count, uint8_t destination, int map_fd) {
@@ -1327,7 +1335,8 @@ static void consume_perf_ring(PerfRing *ring) {
 
                 ProcessInfo process = {
                     .pid = bpf_event.pid,
-                    .ppid = bpf_event.ppid
+                    .ppid = bpf_event.ppid,
+                    .cgroup_id = bpf_event.cgroup_id
                 };
                 snprintf(process.name, sizeof(process.name), "%.*s", (int)sizeof(bpf_event.comm), bpf_event.comm);
                 if (resolve_linux_cmdline_process_name_once(process.pid, process.name, process.name, sizeof(process.name))) {
@@ -1841,6 +1850,11 @@ static void add_event(const char *type, const ProcessInfo *process, const char *
     event.timestamp = current_time_seconds();
     event.pid = process ? process->pid : 0;
     event.ppid = process ? process->ppid : 0;
+    event.container = container_host();
+    event.cgroup_id = process ? process->cgroup_id : 0;
+#ifdef __linux__
+    if (event.cgroup_id) event.container = container_for_cgroup(event.cgroup_id);
+#endif
     snprintf(event.type, sizeof(event.type), "%s", type);
     snprintf(event.process, sizeof(event.process), "%s", process ? process->name : "firehose");
     snprintf(event.path, sizeof(event.path), "%s", path ? path : "");
@@ -2188,6 +2202,7 @@ static const char *event_value_for_filter_column(const TraceEvent *event,
                                                  const char *column,
                                                  char *scratch,
                                                  size_t scratch_size) {
+    if (strcmp(column, "container") == 0) return event->container.id;
     if (strcmp(column, "event") == 0) {
         return event->type;
     }
@@ -2962,6 +2977,7 @@ static size_t build_events_binary(size_t start, size_t count, bool tail, const E
         variable_size += strlen(events[i].process);
         variable_size += strlen(events[i].path);
         variable_size += strlen(events[i].detail);
+        variable_size += strlen(events[i].container.name) + strlen(events[i].container.id);
     }
     if (fixed_size > SIZE_MAX - variable_size) {
         return 0;
@@ -2998,11 +3014,14 @@ static size_t build_events_binary(size_t start, size_t count, bool tail, const E
         write_double_le(buffer + record_offset + 8, event->timestamp);
         write_uint32_le(buffer + record_offset + 16, (uint32_t)event->pid);
         write_uint32_le(buffer + record_offset + 20, (uint32_t)event->ppid);
+        write_uint64_le(buffer + record_offset + 80, event->cgroup_id);
         if (!append_string_ref(buffer, total_size, &variable_offset, record_offset + 24, time_buffer) ||
             !append_string_ref(buffer, total_size, &variable_offset, record_offset + 32, event->type) ||
             !append_string_ref(buffer, total_size, &variable_offset, record_offset + 40, event->process) ||
             !append_string_ref(buffer, total_size, &variable_offset, record_offset + 48, event->detail) ||
-            !append_string_ref(buffer, total_size, &variable_offset, record_offset + 56, event->path)) {
+            !append_string_ref(buffer, total_size, &variable_offset, record_offset + 56, event->path) ||
+            !append_string_ref(buffer, total_size, &variable_offset, record_offset + 64, event->container.name) ||
+            !append_string_ref(buffer, total_size, &variable_offset, record_offset + 72, event->container.id)) {
             free(buffer);
             return 0;
         }
@@ -3696,6 +3715,8 @@ static void handle_client(int fd) {
     bool send_body = strcasecmp(method, "HEAD") != 0;
     if (strcmp(target, "/") == 0 && !request_accepts_outerframe(request, request_header_length)) {
         send_web_file(fd, "index.html", "text/html; charset=utf-8", request, request_header_length, send_body);
+    } else if (strcmp(target, "/web/app-icon.png") == 0 || strcmp(target, "/favicon.ico") == 0) {
+        send_web_file(fd, "app-icon.png", "image/png", request, request_header_length, send_body);
     } else if (strcmp(target, "/web/app.css") == 0) {
         send_web_file(fd, "app.css", "text/css; charset=utf-8", request, request_header_length, send_body);
     } else if (strcmp(target, "/web/app.js") == 0) {
@@ -3710,6 +3731,10 @@ static void handle_client(int fd) {
     } else if (strcmp(target, kBundleUrlPathMacosX86) == 0) {
         const char *path = g_bundle_file_path_macos_x86[0] ? g_bundle_file_path_macos_x86 : kBundleFilePathMacosX86;
         send_bundle_file(fd, path, request, request_header_length, send_body);
+    } else if (strcmp(target, "/api/containers") == 0) {
+        size_t size=0; unsigned char *bytes=container_catalog(&size);
+        if (bytes) { send_response(fd,200,"OK","application/octet-stream",bytes,size); free(bytes); }
+        else send_text_response(fd,500,"out of memory\n");
     } else if (strcmp(target, "/api/events") == 0) {
         send_events_response(fd, query);
     } else if (strcmp(target, "/api/event-position") == 0) {
@@ -3845,6 +3870,7 @@ static void print_usage(const char *program) {
 }
 
 int main(int argc, char **argv) {
+    container_start();
     signal(SIGPIPE, SIG_IGN);
     struct sigaction action;
     memset(&action, 0, sizeof(action));

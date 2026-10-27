@@ -74,3 +74,11 @@ sudo ./FirehoseBackend --port 7353 --bundles-dir ./bundles --capture ebpf
 - `Frontend/TraceContent.swift`: native outerframe table UI with scroll/key navigation and viewport-sized API fetches.
 - `Backend/main.c`: loopback HTTP server, eBPF process collector, event ring buffer, `.outer` descriptor, and bundle serving.
 - `Scripts/archive_trace_bundle.sh`: creates `FirehoseContent.bundle.macos-arm.aar` and `FirehoseContent.bundle.macos-x86.aar`.
+
+## Container-aware HTML view
+
+On Linux with cgroup v2, Firehose captures the emitting task's cgroup ID in each eBPF event. A background thread discovers registered Docker containers through Outer Shell's binary registry API and maps cgroup filesystem IDs to container identities. Event records retain the observed identity/name after the process exits. The HTML container picker filters both events and the process timeline on the server. PIDs remain host PIDs.
+
+Discovery refreshes every five seconds. Events from cgroups not yet discovered are explicitly labeled unresolved, rather than attributed to the host. The collector runs on the Linux host; containers inside a different VM/kernel are not supported by this path. No container helper or additional container privileges are installed.
+
+Run `python3 Scripts/test_container_events.py` for sanitizer-backed fork-path copying, event identity, binary encoding, and filtering checks.

@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
   <title>Firehose</title>
   <link rel="stylesheet" href="/web/app.css">
+  <link rel="icon" type="image/png" href="/web/app-icon.png">
 </head>
 <body>
   <main>
@@ -13,6 +14,7 @@
       <div class="header-controls">
         <button id="capture" type="button" title="Pause or resume" aria-label="Pause capture">Ⅱ</button>
         <button id="clear" type="button" title="Clear events" aria-label="Clear events">×</button>
+        <select id="container" aria-label="Container"><option value="">All containers and host</option><option value="host">Host</option></select>
         <input id="filter" placeholder="Filter: All events" aria-label="Filter events">
       </div>
     </header>
@@ -24,7 +26,14 @@
         <span>Path</span>
         <span>Detail</span>
       </div>
-      <div id="eventRows"></div>
+      <nav class="event-navigation" aria-label="Event history">
+        <button id="oldest" type="button">Oldest</button>
+        <button id="older" type="button">Older</button>
+        <span id="eventRange" aria-live="off">Loading…</span>
+        <button id="newer" type="button">Newer</button>
+        <button id="live" type="button" aria-pressed="true">Live</button>
+      </nav>
+      <div id="eventRows" tabindex="0" aria-label="Scrollable event history"><div id="eventExtent"><div id="eventWindow"></div></div></div>
     </section>
     <section class="processes" aria-label="Process activity">
       <div id="processRows"></div>

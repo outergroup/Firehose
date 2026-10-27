@@ -3,7 +3,47 @@
 
   const $ = selector => document.querySelector(selector);
   const decoder = new TextDecoder();
+  class EventHistory {
+    constructor() { this.reset(); }
+    reset() {
+      this.events = [];
+      this.start = 0;
+      this.matched = 0;
+      this.total = 0;
+      this.live = true;
+    }
+    geometry(height) {
+      const extent = Math.max(height, Math.min(8000000, this.matched * 31));
+      return { extent, physical: extent - height, logical: Math.max(0, this.matched * 31 - height) };
+    }
+    offset(scrollTop, height) {
+      const geometry = this.geometry(height);
+      return geometry.physical ? scrollTop / geometry.physical * geometry.logical : 0;
+    }
+    scrollTop(offset, height) {
+      const geometry = this.geometry(height);
+      return geometry.logical ? offset / geometry.logical * geometry.physical : 0;
+    }
+    query(offset, height) {
+      return new URLSearchParams({
+        tail: String(this.live),
+        start: String(Math.max(0, Math.floor(offset / 31) - 32)),
+        count: String(Math.ceil(height / 31) + 64)
+      });
+    }
+    accept(result) {
+      const cleared = result.total < this.total;
+      if (cleared) this.reset();
+      this.matched = result.matched;
+      this.total = result.total;
+      this.events = result.events;
+      this.start = result.start;
+      return cleared;
+    }
+  }
+
   const state = {
+    history: new EventHistory(),
     paused: false,
     filter: '',
     clauses: [],
@@ -36,6 +76,7 @@
   function appendFilters(query) {
     const typed = state.filter.trim();
     const clauses = [...state.clauses];
+    if ($('#container').value) clauses.push({ column: 'container', op: 'equals', value: $('#container').value });
     if (typed) clauses.push({ column: 'detail', op: 'contains', value: typed });
     query.set('filterCount', clauses.length);
     clauses.forEach((filter, index) => {
@@ -44,13 +85,6 @@
       query.set(`f${index}value`, filter.value);
     });
     return query;
-  }
-
-  function eventQuery() {
-    return appendFilters(new URLSearchParams({
-      tail: 'true',
-      count: String(visibleCount('#eventRows', 31, 30, 220))
-    }));
   }
 
   function processQuery() {
@@ -81,29 +115,40 @@
         type: stringAt(buffer, view, offset + 32),
         process: stringAt(buffer, view, offset + 40),
         detail: stringAt(buffer, view, offset + 48),
-        path: stringAt(buffer, view, offset + 56)
+        path: stringAt(buffer, view, offset + 56),
+        container: stringAt(buffer, view, offset + 64),
+        containerID: stringAt(buffer, view, offset + 72)
       });
     }
     return { matched, start, total, flags, events };
   }
 
-  function renderEvents(result) {
-    state.events = result.events;
+  function updateCaptureStatus(result) {
     state.paused = Boolean(result.flags & 1);
     $('#capture').textContent = state.paused ? '▶' : 'Ⅱ';
     $('#capture').setAttribute('aria-label', state.paused ? 'Resume capture' : 'Pause capture');
-    $('#summary').textContent = `Showing ${result.matched.toLocaleString()} of ${result.total.toLocaleString()} events (${result.total ? Math.round(result.matched / result.total * 100) : 100}%) — ${state.paused ? 'Tracing paused' : 'Tracing live'}`;
+    $('#summary').textContent = `${result.matched.toLocaleString()} matching of ${result.total.toLocaleString()} events (${result.total ? Math.round(result.matched / result.total * 100) : 100}%) — ${state.paused ? 'Tracing paused' : 'Tracing live'}`;
+  }
+
+  function renderEvents(result) {
+    state.events = result.events;
+    const picker = $('#container');
+    for (const event of result.events) {
+      if (![...picker.options].some(option => option.value === event.containerID)) picker.add(new Option(event.container, event.containerID));
+    }
+    updateCaptureStatus(result);
 
     const mobile = compactUI();
-    $('#eventRows').replaceChildren(...result.events.map(event => {
+    $('#eventWindow').replaceChildren(...result.events.map((event, index) => {
       const row = document.createElement('div');
       row.className = 'event-row' + (event.id === state.selectedEventID ? ' selected' : '');
       row.dataset.eventId = String(event.id);
+      row.classList.toggle('alternate', (result.start + index) % 2 === 1);
       row.innerHTML = '<span></span><span></span><span class="pid"></span><span></span><span></span>';
       const cells = row.children;
       cells[0].textContent = event.time;
       cells[1].textContent = event.type;
-      cells[2].textContent = `${event.pid}  ${event.process}`;
+      cells[2].textContent = `${event.pid}  ${event.process} · ${event.container}`;
       cells[3].textContent = event.path;
       cells[4].textContent = event.detail;
       row.oncontextmenu = pointerEvent => showContext(pointerEvent, event);
@@ -185,18 +230,114 @@
     }));
   }
 
+  let eventController = null;
+  let eventGeneration = 0;
+  let logicalOffset = 0;
+  let expectedScrollTop = null;
+  let scrollFrame = 0;
+
+  function updateEventNavigation() {
+    const history = state.history;
+    const first = Math.floor(logicalOffset / 31);
+    const end = Math.min(history.matched, Math.ceil((logicalOffset + $('#eventRows').clientHeight) / 31));
+    $('#older').disabled = $('#oldest').disabled = first === 0;
+    $('#newer').disabled = end >= history.matched;
+    $('#live').classList.toggle('active', history.live);
+    $('#live').setAttribute('aria-pressed', String(history.live));
+    $('#eventRange').textContent = history.matched
+      ? `${(first + 1).toLocaleString()}–${end.toLocaleString()} of ${history.matched.toLocaleString()}`
+      : 'No events';
+  }
+
+  function positionEvents() {
+    const rows = $('#eventRows');
+    const history = state.history;
+    const geometry = history.geometry(rows.clientHeight);
+    logicalOffset = history.live ? geometry.logical : Math.min(logicalOffset, geometry.logical);
+    $('#eventExtent').style.height = geometry.extent + 'px';
+    const top = history.scrollTop(logicalOffset, rows.clientHeight);
+    expectedScrollTop = top;
+    rows.scrollTop = top;
+    $('#eventWindow').style.top = (top + history.start * 31 - logicalOffset) + 'px';
+    updateEventNavigation();
+  }
+
+  async function loadEvents() {
+    eventController?.abort();
+    const controller = new AbortController();
+    eventController = controller;
+    const generation = eventGeneration;
+    try {
+      const query = state.history.query(logicalOffset, $('#eventRows').clientHeight);
+      const response = await fetch('/api/events?' + appendFilters(query), { signal: controller.signal });
+      if (!response.ok) throw Error(await response.text());
+      const result = parseEvents(await response.arrayBuffer());
+      if (controller.signal.aborted || generation !== eventGeneration) return;
+      const cleared = state.history.accept(result);
+      renderEvents(result);
+      positionEvents();
+      if (cleared) requestAnimationFrame(() => loadEvents());
+    } catch (error) {
+      if (!controller.signal.aborted && generation === eventGeneration) $('#summary').textContent = error.message;
+    } finally {
+      if (eventController === controller) eventController = null;
+    }
+  }
+
+  function navigateEvents(mode) {
+    state.history.live = mode === 'live';
+    const height = $('#eventRows').clientHeight;
+    if (mode === 'oldest') logicalOffset = 0;
+    else if (mode === 'older') logicalOffset = Math.max(0, logicalOffset - height);
+    else if (mode === 'newer') logicalOffset += height;
+    $('#eventWindow').replaceChildren();
+    positionEvents();
+    loadEvents();
+  }
+
+  function resetEvents() {
+    eventGeneration++;
+    state.history.reset();
+    state.events = [];
+    logicalOffset = 0;
+    $('#eventWindow').replaceChildren();
+    positionEvents();
+    loadEvents();
+    refresh();
+  }
+
+  $('#oldest').onclick = () => navigateEvents('oldest');
+  $('#older').onclick = () => navigateEvents('older');
+  $('#newer').onclick = () => navigateEvents('newer');
+  $('#live').onclick = () => navigateEvents('live');
+  $('#eventRows').onscroll = () => {
+    const rows = $('#eventRows');
+    if (expectedScrollTop !== null && Math.abs(rows.scrollTop - expectedScrollTop) < 1) return;
+    expectedScrollTop = null;
+    logicalOffset = state.history.offset(rows.scrollTop, rows.clientHeight);
+    state.history.live = rows.scrollHeight - rows.clientHeight - rows.scrollTop < 1;
+    eventController?.abort();
+    const first = Math.floor(logicalOffset / 31);
+    const end = Math.ceil((logicalOffset + rows.clientHeight) / 31);
+    const history = state.history;
+    if (first < history.start || end > history.start + history.events.length) $('#eventWindow').replaceChildren();
+    $('#eventWindow').style.top = (rows.scrollTop + history.start * 31 - logicalOffset) + 'px';
+    updateEventNavigation();
+    cancelAnimationFrame(scrollFrame);
+    scrollFrame = requestAnimationFrame(() => loadEvents());
+  };
+
   async function refresh() {
+    if (!eventController) loadEvents();
     if (state.refreshing) return;
     state.refreshing = true;
+    const generation = eventGeneration;
     try {
-      const [eventResponse, processResponse] = await Promise.all([
-        fetch('/api/events?' + eventQuery()),
-        fetch('/api/processes?' + processQuery())
-      ]);
-      if (eventResponse.ok) renderEvents(parseEvents(await eventResponse.arrayBuffer()));
-      if (processResponse.ok) renderProcesses(parseProcesses(await processResponse.arrayBuffer()));
+      const response = await fetch('/api/processes?' + processQuery());
+      const buffer = await response.arrayBuffer();
+      if (response.ok && generation === eventGeneration) renderProcesses(parseProcesses(buffer));
     } catch (error) {
-      $('#summary').textContent = error.message;
+      if (generation === eventGeneration) $('#summary').textContent = error.message;
     } finally {
       state.refreshing = false;
     }
@@ -274,7 +415,7 @@
   function addFilter(column, op, value) {
     state.clauses.push({ column, op, value });
     $('#filter').placeholder = `${state.clauses.length} filter${state.clauses.length === 1 ? '' : 's'} active`;
-    refresh();
+    resetEvents();
   }
 
   $('#capture').onclick = async () => {
@@ -287,14 +428,34 @@
     await fetch('/api/clear');
     state.clauses = [];
     hideContext();
-    refresh();
+    resetEvents();
   };
 
+  $('#container').onchange = resetEvents;
+  async function refreshContainers() {
+    try {
+      const response = await fetch('/api/containers');
+      if (!response.ok) return;
+      const buffer = await response.arrayBuffer(), view = new DataView(buffer);
+      if (buffer.byteLength < 16 || u32(view, 0) !== 0x54585443 || u32(view, 4) !== 1 || u32(view, 8) !== buffer.byteLength) return;
+      const count = u32(view, 12);
+      if (count > (buffer.byteLength - 16) / 16) return;
+      const picker = $('#container');
+      for (let i = 0; i < count; i++) {
+        const id = stringAt(buffer, view, 16 + i * 16), name = stringAt(buffer, view, 24 + i * 16);
+        const option = [...picker.options].find(option => option.value === id);
+        if (option) option.textContent = name;
+        else picker.add(new Option(name, id));
+      }
+    } catch (error) { console.warn('Container discovery unavailable', error); }
+  }
+  refreshContainers();
+  setInterval(refreshContainers, 5000);
   let filterTimer;
   $('#filter').oninput = event => {
     state.filter = event.target.value;
     clearTimeout(filterTimer);
-    filterTimer = setTimeout(refresh, 180);
+    filterTimer = setTimeout(resetEvents, 180);
   };
 
   $('#contextScrim').onpointerdown = hideContext;

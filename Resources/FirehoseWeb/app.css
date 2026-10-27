@@ -92,7 +92,7 @@ button:active { background: color-mix(in srgb, var(--button) 72%, var(--text)); 
 
 .events {
   display: grid;
-  grid-template-rows: 36px minmax(0, 1fr);
+  grid-template-rows: 36px 34px minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
   overflow: hidden;
@@ -120,6 +120,8 @@ button:active { background: color-mix(in srgb, var(--button) 72%, var(--text)); 
 .event-head span + span { border-left: 1px solid var(--line); padding-left: 9px; }
 
 #eventRows {
+  position: relative;
+  overflow-anchor: none;
   min-width: 0;
   min-height: 0;
   overflow: auto;
@@ -133,7 +135,7 @@ button:active { background: color-mix(in srgb, var(--button) 72%, var(--text)); 
   contain: layout paint style;
 }
 
-.event-row:nth-child(even) { background: var(--alt); }
+.event-row.alternate { background: var(--alt); }
 .event-row.selected { background: var(--selected); color: #fff; }
 .event-row span { overflow: hidden; text-overflow: ellipsis; padding-right: 12px; }
 .pid { font-variant-numeric: tabular-nums; }
@@ -280,7 +282,7 @@ button:active { background: color-mix(in srgb, var(--button) 72%, var(--text)); 
     height: 36px;
   }
 
-  .events { grid-template-rows: 33px minmax(0, 1fr); }
+  .events { grid-template-rows: 33px 34px minmax(0, 1fr); }
   .event-head, .event-row {
     grid-template-columns: 88px 112px minmax(0, 1fr);
     padding-inline: 10px;
@@ -316,7 +318,7 @@ button:active { background: color-mix(in srgb, var(--button) 72%, var(--text)); 
   .header-controls { gap: 7px; }
   .header-controls button { width: 34px; height: 34px; }
   #filter { width: clamp(190px, 28vw, 270px); height: 34px; }
-  .events { grid-template-rows: 31px minmax(0, 1fr); }
+  .events { grid-template-rows: 31px 34px minmax(0, 1fr); }
   .event-row { min-height: 30px; }
   .processes { padding-block: 3px calc(5px + var(--outerloop-overlay-clearance)); }
   .process-row { min-height: 32px; }
@@ -335,3 +337,16 @@ button:active { background: color-mix(in srgb, var(--button) 72%, var(--text)); 
 @media (hover: none) and (pointer: coarse) and (orientation: landscape) {
   :root { --outerloop-overlay-clearance: 16px; }
 }
+
+#container { font: inherit; color: inherit; background: var(--field, var(--button)); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; max-width: 240px; min-width: 0; }
+@media (max-width: 760px) { .header-controls { flex-wrap: wrap; } #container { flex: 1 1 140px; } #filter { flex: 1 1 180px; } }
+
+.event-navigation { display: flex; align-items: center; gap: 6px; padding: 3px 10px; border-bottom: 1px solid var(--line); }
+.event-navigation button { width: auto; height: 26px; padding: 2px 9px; border-radius: 5px; font: inherit; font-size: 12px; }
+.event-navigation button:disabled { opacity: .4; cursor: default; }
+.event-navigation #live.active { background: var(--selected); color: white; border-color: var(--selected); }
+#eventRange { flex: 1; min-width: 0; text-align: center; font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+#eventExtent { position: relative; overflow: hidden; }
+#eventWindow { position: absolute; left: 0; right: 0; }
+.event-row { height: 31px; min-height: 31px; max-height: 31px; }
