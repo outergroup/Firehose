@@ -17,6 +17,10 @@
         <select id="container" aria-label="Container"><option value="">All containers and host</option><option value="host">Host</option></select>
         <input id="filter" placeholder="Filter: All events" aria-label="Filter events">
       </div>
+      <aside id="captureHelp" role="status" hidden>
+        <span id="captureHelpMessage"></span>
+        <a id="kernelGuide" href="/help/apple-container" hidden>Set up an Apple Container tracing kernel…</a>
+      </aside>
     </header>
     <section class="events" aria-label="Events">
       <div class="event-head">

@@ -27,6 +27,7 @@
 
 #include "HTTPCache.h"
 #include "ContainerContext.h"
+#include "TracingStream.h"
 
 #ifdef __APPLE__
 #include <sys/sysctl.h>
@@ -708,8 +709,8 @@ static bool resolve_linux_cmdline_process_name_once(int pid, const char *comm, c
 #define TRACE_BPF_EVENT_WRITE 8
 #define TRACE_BPF_EVENT_OPENAT_RET 9
 #define TRACE_BPF_EVENT_OPENAT2_RET 10
-#define TRACE_BPF_EVENT_SIZE 192
-#define TRACE_BPF_STACK_OFF (-192)
+#define TRACE_BPF_EVENT_SIZE 208
+#define TRACE_BPF_STACK_OFF (-208)
 #define TRACE_BPF_FORK_PARENT_PID_OFFSET 24
 #define TRACE_BPF_FORK_CHILD_COMM_OFFSET 28
 #define TRACE_BPF_FORK_CHILD_PID_OFFSET 44
@@ -728,6 +729,9 @@ typedef struct {
     char comm[16];
     char text[TRACE_BPF_TEXT_LEN];
     uint64_t cgroup_id;
+    uint64_t kernel_pid_tgid;
+    uint32_t namespace_tid;
+    uint32_t namespace_tgid;
 } BPFKernelEvent;
 
 typedef struct {
@@ -876,6 +880,37 @@ static void append_ld_map_fd(struct bpf_insn *insns, size_t *count, uint8_t dest
     insns[(*count)++] = TRACE_BPF_INSN(0, 0, 0, 0, 0);
 }
 
+static void append_immediate64(struct bpf_insn *insns, size_t *count, uint8_t reg, uint64_t value) {
+    insns[(*count)++] = TRACE_BPF_INSN(BPF_LD | BPF_DW | BPF_IMM, reg, 0, 0, (int32_t)value);
+    insns[(*count)++] = TRACE_BPF_INSN(0, 0, 0, 0, (int32_t)(value >> 32));
+}
+
+static struct stat g_capture_pid_namespace;
+
+static void append_namespace_identity(struct bpf_insn *insns, size_t *count, bool fork_event) {
+    if (!container_selected().id[0]) return;
+    insns[(*count)++] = TRACE_BPF_EMIT_CALL(BPF_FUNC_get_current_pid_tgid);
+    insns[(*count)++] = TRACE_BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_0, TRACE_BPF_STACK_OFF + 192);
+    append_immediate64(insns, count, BPF_REG_1, g_capture_pid_namespace.st_dev);
+    append_immediate64(insns, count, BPF_REG_2, g_capture_pid_namespace.st_ino);
+    insns[(*count)++] = TRACE_BPF_MOV64_REG(BPF_REG_3, BPF_REG_10);
+    insns[(*count)++] = TRACE_BPF_ALU64_IMM(BPF_ADD, BPF_REG_3, TRACE_BPF_STACK_OFF + 200);
+    insns[(*count)++] = TRACE_BPF_MOV64_IMM(BPF_REG_4, 8);
+    insns[(*count)++] = TRACE_BPF_EMIT_CALL(BPF_FUNC_get_ns_current_pid_tgid);
+    insns[(*count)++] = TRACE_BPF_INSN(BPF_JMP | BPF_JEQ | BPF_K, BPF_REG_0, 0, 2, 0);
+    insns[(*count)++] = TRACE_BPF_MOV64_IMM(BPF_REG_0, 0);
+    insns[(*count)++] = TRACE_BPF_EXIT_INSN();
+    insns[(*count)++] = TRACE_BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, TRACE_BPF_STACK_OFF + 200);
+    if (fork_event) {
+        insns[(*count)++] = TRACE_BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_2, TRACE_BPF_STACK_OFF + 16);
+    } else {
+        insns[(*count)++] = TRACE_BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_2, TRACE_BPF_STACK_OFF + 12);
+        insns[(*count)++] = TRACE_BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_2, TRACE_BPF_STACK_OFF + 20);
+        insns[(*count)++] = TRACE_BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_10, TRACE_BPF_STACK_OFF + 204);
+        insns[(*count)++] = TRACE_BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_2, TRACE_BPF_STACK_OFF + 16);
+    }
+}
+
 static void append_perf_submit(struct bpf_insn *insns, size_t *count, int map_fd, int output_cpu) {
     insns[(*count)++] = TRACE_BPF_MOV64_REG(BPF_REG_1, BPF_REG_6);
     append_ld_map_fd(insns, count, BPF_REG_2, map_fd);
@@ -890,7 +925,7 @@ static void append_perf_submit(struct bpf_insn *insns, size_t *count, int map_fd
 
 static int load_fork_bpf_program(int map_fd, int output_cpu, ForkTracepointOffsets offsets,
                                  char *error, size_t error_size) {
-    struct bpf_insn insns[96];
+    struct bpf_insn insns[160];
     size_t count = 0;
 
     insns[count++] = TRACE_BPF_MOV64_REG(BPF_REG_6, BPF_REG_1);
@@ -917,13 +952,14 @@ static int load_fork_bpf_program(int map_fd, int output_cpu, ForkTracepointOffse
             insns[count++] = TRACE_BPF_STX_MEM(BPF_W, BPF_REG_10, BPF_REG_2, TRACE_BPF_STACK_OFF + 40 + i);
         }
     }
+    append_namespace_identity(insns, &count, true);
     append_perf_submit(insns, &count, map_fd, output_cpu);
 
     return load_bpf_program(insns, count, "firehose_fork", error, error_size);
 }
 
 static int load_exit_bpf_program(int map_fd, int output_cpu, char *error, size_t error_size) {
-    struct bpf_insn insns[64];
+    struct bpf_insn insns[160];
     size_t count = 0;
 
     insns[count++] = TRACE_BPF_MOV64_REG(BPF_REG_6, BPF_REG_1);
@@ -940,6 +976,7 @@ static int load_exit_bpf_program(int map_fd, int output_cpu, char *error, size_t
     insns[count++] = TRACE_BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, TRACE_BPF_STACK_OFF + 40);
     insns[count++] = TRACE_BPF_MOV64_IMM(BPF_REG_2, 16);
     insns[count++] = TRACE_BPF_EMIT_CALL(BPF_FUNC_get_current_comm);
+    append_namespace_identity(insns, &count, false);
     append_perf_submit(insns, &count, map_fd, output_cpu);
 
     return load_bpf_program(insns, count, "firehose_exit", error, error_size);
@@ -948,7 +985,7 @@ static int load_exit_bpf_program(int map_fd, int output_cpu, char *error, size_t
 static int load_syscall_bpf_program(int map_fd, int output_cpu, uint32_t event_type,
                                     SyscallTracepointOffsets offsets, const char *name,
                                     char *error, size_t error_size) {
-    struct bpf_insn insns[128];
+    struct bpf_insn insns[160];
     size_t count = 0;
 
     insns[count++] = TRACE_BPF_MOV64_REG(BPF_REG_6, BPF_REG_1);
@@ -980,6 +1017,7 @@ static int load_syscall_bpf_program(int map_fd, int output_cpu, uint32_t event_t
         insns[count++] = TRACE_BPF_MOV64_IMM(BPF_REG_2, TRACE_BPF_TEXT_LEN);
         insns[count++] = TRACE_BPF_EMIT_CALL(BPF_FUNC_probe_read_user_str);
     }
+    append_namespace_identity(insns, &count, false);
     append_perf_submit(insns, &count, map_fd, output_cpu);
 
     return load_bpf_program(insns, count, name, error, error_size);
@@ -999,6 +1037,11 @@ static bool read_text_file(const char *path, char *buffer, size_t buffer_size) {
 static bool read_tracepoint_file(const char *group_name, const char *event_name, const char *file_name,
                                  char *buffer, size_t buffer_size) {
     char path[PATH_MAX];
+    const char *tracefs = getenv("OUTER_TRACEFS");
+    if (tracefs && *tracefs) {
+        snprintf(path, sizeof(path), "%s/events/%s/%s/%s", tracefs, group_name, event_name, file_name);
+        if (read_text_file(path, buffer, buffer_size)) return true;
+    }
     snprintf(path, sizeof(path), "/sys/kernel/tracing/events/%s/%s/%s", group_name, event_name, file_name);
     if (read_text_file(path, buffer, buffer_size)) {
         return true;
@@ -1334,6 +1377,166 @@ static void resolve_pending_fork_group(const ProcessInfo *process) {
     }
 }
 
+typedef struct { uint32_t kernel_tid, tid, tgid; uint64_t timestamp; } NamespaceTask;
+static NamespaceTask g_namespace_tasks[16384];
+static BPFKernelEvent *g_namespace_forks;
+static size_t g_namespace_fork_count;
+
+static void consume_kernel_event(BPFKernelEvent bpf_event, bool resolved_fork) {
+    if (container_selected().id[0] && !resolved_fork) {
+        if (bpf_event.event_type == TRACE_BPF_EVENT_FORK) {
+            NamespaceTask task = g_namespace_tasks[(uint32_t)bpf_event.pid % 16384];
+            if (task.kernel_tid == (uint32_t)bpf_event.pid && task.timestamp >= bpf_event.timestamp_ns) {
+                bpf_event.pid = bpf_event.tid = (int32_t)task.tid;
+                bpf_event.namespace_tgid = task.tgid;
+                consume_kernel_event(bpf_event, true);
+            } else if (g_namespace_fork_count < 65536) {
+                BPFKernelEvent *next = realloc(g_namespace_forks, (g_namespace_fork_count + 1) * sizeof(*next));
+                if (next) { g_namespace_forks = next; next[g_namespace_fork_count++] = bpf_event; }
+            }
+            return;
+        }
+        uint32_t kernel_tid = (uint32_t)bpf_event.kernel_pid_tgid;
+        g_namespace_tasks[kernel_tid % 16384] = (NamespaceTask){kernel_tid, (uint32_t)bpf_event.pid, (uint32_t)bpf_event.ppid, bpf_event.timestamp_ns};
+        for (size_t i = 0; i < g_namespace_fork_count;) {
+            BPFKernelEvent fork = g_namespace_forks[i];
+            if ((uint32_t)fork.pid == kernel_tid && fork.timestamp_ns <= bpf_event.timestamp_ns) {
+                g_namespace_forks[i] = g_namespace_forks[--g_namespace_fork_count];
+                fork.pid = fork.tid = bpf_event.pid;
+                fork.namespace_tgid = (uint32_t)bpf_event.ppid;
+                consume_kernel_event(fork, true);
+            } else { i++; }
+        }
+    }
+    if (container_only() && !container_selected().id[0] && strlen(container_for_cgroup(bpf_event.cgroup_id).id)!=64) {
+        return;
+    }
+
+    if (bpf_event.event_type == TRACE_BPF_EVENT_FORK) {
+        cmdline_process_name_cache_remove_pid(bpf_event.pid);
+    }
+
+    ProcessInfo process = {
+        .pid = bpf_event.pid,
+        .ppid = bpf_event.ppid,
+        .tgid = bpf_event.event_type == TRACE_BPF_EVENT_FORK ? (container_selected().id[0] ? (int)bpf_event.namespace_tgid : read_task_group(bpf_event.pid)) : bpf_event.ppid,
+        .cgroup_id = bpf_event.cgroup_id
+    };
+    snprintf(process.name, sizeof(process.name), "%.*s", (int)sizeof(bpf_event.comm), bpf_event.comm);
+    if (resolve_linux_cmdline_process_name_once(process.pid, process.name, process.name, sizeof(process.name))) {
+        process.name[sizeof(process.name) - 1] = '\0';
+    }
+    if (process.name[0] == '\0') {
+        snprintf(process.name, sizeof(process.name), "pid-%d", process.pid);
+    }
+
+    size_t group_slot = (unsigned)process.pid % 8192;
+    if (!process.tgid && g_recent_task_groups[group_slot].tid == process.pid &&
+        g_recent_task_groups[group_slot].timestamp >= bpf_event.timestamp_ns) {
+        process.tgid = g_recent_task_groups[group_slot].tgid;
+    }
+    if (process.tgid > 0) {
+        g_recent_task_groups[group_slot].tid = process.pid;
+        g_recent_task_groups[group_slot].tgid = process.tgid;
+        g_recent_task_groups[group_slot].timestamp = bpf_event.timestamp_ns;
+    }
+    resolve_group_name(&process);
+    if (process.tgid > 0) resolve_pending_fork_group(&process);
+    char detail[256];
+    char event_path[EVENT_PATH_LEN] = "";
+    if (bpf_event.event_type == TRACE_BPF_EVENT_FORK) {
+        process_parent_set(process.pid, process.ppid);
+        fd_path_copy_pid(process.ppid, process.pid);
+        snprintf(detail, sizeof(detail), "Forked from parent pid %d", process.ppid);
+        size_t index = g_events.count;
+        add_event("process.fork", &process, "", detail);
+        if (!process.tgid && g_events.count > index) {
+            PendingForkGroup *next = realloc(g_pending_fork_groups, (g_pending_fork_group_count + 1) * sizeof(*next));
+            if (next) {
+                g_pending_fork_groups = next;
+                next[g_pending_fork_group_count++] = (PendingForkGroup){process.pid, index};
+            } else fprintf(stderr, "FirehoseBackend could not retain pending fork group\n");
+        }
+    } else if (bpf_event.event_type == TRACE_BPF_EVENT_EXIT) {
+        process.ppid = process_parent_lookup(process.pid);
+        pending_open_remove_pid(process.pid);
+        fd_path_remove_pid(process.pid);
+        process_parent_remove(process.pid);
+        cmdline_process_name_cache_remove_pid(process.pid);
+        snprintf(detail, sizeof(detail), "Exited %s", process.name);
+        add_event("process.exit", &process, "", detail);
+    } else if (bpf_event.event_type == TRACE_BPF_EVENT_OPENAT) {
+        process.ppid = process_parent_lookup(process.pid);
+        snprintf(event_path, sizeof(event_path), "%s", bpf_event.text[0] ? bpf_event.text : "");
+        pending_open_set(process.pid, bpf_event.tid, event_path);
+        snprintf(detail, sizeof(detail), "dfd=%lld flags=0x%llx path=%s",
+                 (long long)bpf_event.arg0,
+                 (unsigned long long)bpf_event.arg1,
+                 bpf_event.text[0] ? bpf_event.text : "(unavailable)");
+        add_event("file.openat", &process, event_path, detail);
+    } else if (bpf_event.event_type == TRACE_BPF_EVENT_OPENAT2) {
+        process.ppid = process_parent_lookup(process.pid);
+        snprintf(event_path, sizeof(event_path), "%s", bpf_event.text[0] ? bpf_event.text : "");
+        pending_open_set(process.pid, bpf_event.tid, event_path);
+        snprintf(detail, sizeof(detail), "dfd=%lld path=%s",
+                 (long long)bpf_event.arg0,
+                 bpf_event.text[0] ? bpf_event.text : "(unavailable)");
+        add_event("file.openat2", &process, event_path, detail);
+    } else if (bpf_event.event_type == TRACE_BPF_EVENT_OPENAT_RET ||
+               bpf_event.event_type == TRACE_BPF_EVENT_OPENAT2_RET) {
+        int fd = (int64_t)bpf_event.arg0 >= 0 ? (int)bpf_event.arg0 : -1;
+        if (pending_open_take(process.pid, bpf_event.tid, event_path, sizeof(event_path)) && fd >= 0) {
+            fd_path_set(process.pid, fd, event_path);
+        }
+    } else if (bpf_event.event_type == TRACE_BPF_EVENT_EXECVE) {
+        process.ppid = process_parent_lookup(process.pid);
+        snprintf(event_path, sizeof(event_path), "%s", bpf_event.text[0] ? bpf_event.text : "");
+        snprintf(detail, sizeof(detail), "path=%s",
+                 bpf_event.text[0] ? bpf_event.text : "(unavailable)");
+        add_event("process.execve", &process, event_path, detail);
+        cmdline_process_name_cache_remove_pid(process.pid);
+    } else if (bpf_event.event_type == TRACE_BPF_EVENT_CLOSE) {
+        process.ppid = process_parent_lookup(process.pid);
+        int fd = (int)bpf_event.arg0;
+        resolve_fd_path(process.pid, fd, event_path, sizeof(event_path));
+        snprintf(detail, sizeof(detail), "fd=%llu", (unsigned long long)bpf_event.arg0);
+        add_event("file.close", &process, event_path, detail);
+        fd_path_remove(process.pid, fd);
+    } else if (bpf_event.event_type == TRACE_BPF_EVENT_READ) {
+        process.ppid = process_parent_lookup(process.pid);
+        int fd = (int)bpf_event.arg0;
+        resolve_fd_path(process.pid, fd, event_path, sizeof(event_path));
+        snprintf(detail, sizeof(detail), "fd=%llu count=%llu",
+                 (unsigned long long)bpf_event.arg0,
+                 (unsigned long long)bpf_event.arg1);
+        add_event("file.read", &process, event_path, detail);
+    } else if (bpf_event.event_type == TRACE_BPF_EVENT_WRITE) {
+        process.ppid = process_parent_lookup(process.pid);
+        int fd = (int)bpf_event.arg0;
+        resolve_fd_path(process.pid, fd, event_path, sizeof(event_path));
+        if (process.pid == getpid() && fd == g_events.fd) {
+            if (event_path[0] == '\0') {
+                snprintf(event_path, sizeof(event_path), "%.*s",
+                         (int)sizeof(event_path) - 1,
+                         g_events.path);
+            }
+            if (!g_events.reported_recursive_write_ignore) {
+                g_events.reported_recursive_write_ignore = true;
+                snprintf(detail, sizeof(detail),
+                         "fd=%llu count=%llu; Ignoring subsequent writes, to avoid recursive explosion",
+                         (unsigned long long)bpf_event.arg0,
+                         (unsigned long long)bpf_event.arg1);
+                add_event("file.write", &process, event_path, detail);
+            }
+        } else {
+            snprintf(detail, sizeof(detail), "fd=%llu count=%llu",
+                     (unsigned long long)bpf_event.arg0,
+                     (unsigned long long)bpf_event.arg1);
+            add_event("file.write", &process, event_path, detail);
+        }
+    }
+}
+
 static void consume_perf_ring(PerfRing *ring) {
     if (ring->fd < 0 || !ring->mapping) {
         return;
@@ -1360,129 +1563,7 @@ static void consume_perf_ring(PerfRing *ring) {
                 copy_from_perf_ring(&bpf_event, data, ring->data_size, tail,
                                      sizeof(header) + sizeof(raw_size), sizeof(bpf_event));
 
-                if (bpf_event.event_type == TRACE_BPF_EVENT_FORK) {
-                    cmdline_process_name_cache_remove_pid(bpf_event.pid);
-                }
-
-                ProcessInfo process = {
-                    .pid = bpf_event.pid,
-                    .ppid = bpf_event.ppid,
-                    .tgid = bpf_event.event_type == TRACE_BPF_EVENT_FORK ? read_task_group(bpf_event.pid) : bpf_event.ppid,
-                    .cgroup_id = bpf_event.cgroup_id
-                };
-                snprintf(process.name, sizeof(process.name), "%.*s", (int)sizeof(bpf_event.comm), bpf_event.comm);
-                if (resolve_linux_cmdline_process_name_once(process.pid, process.name, process.name, sizeof(process.name))) {
-                    process.name[sizeof(process.name) - 1] = '\0';
-                }
-                if (process.name[0] == '\0') {
-                    snprintf(process.name, sizeof(process.name), "pid-%d", process.pid);
-                }
-
-                size_t group_slot = (unsigned)process.pid % 8192;
-                if (!process.tgid && g_recent_task_groups[group_slot].tid == process.pid &&
-                    g_recent_task_groups[group_slot].timestamp >= bpf_event.timestamp_ns) {
-                    process.tgid = g_recent_task_groups[group_slot].tgid;
-                }
-                if (process.tgid > 0) {
-                    g_recent_task_groups[group_slot].tid = process.pid;
-                    g_recent_task_groups[group_slot].tgid = process.tgid;
-                    g_recent_task_groups[group_slot].timestamp = bpf_event.timestamp_ns;
-                }
-                resolve_group_name(&process);
-                if (process.tgid > 0) resolve_pending_fork_group(&process);
-                char detail[256];
-                char event_path[EVENT_PATH_LEN] = "";
-                if (bpf_event.event_type == TRACE_BPF_EVENT_FORK) {
-                    process_parent_set(process.pid, process.ppid);
-                    fd_path_copy_pid(process.ppid, process.pid);
-                    snprintf(detail, sizeof(detail), "Forked from parent pid %d", process.ppid);
-                    size_t index = g_events.count;
-                    add_event("process.fork", &process, "", detail);
-                    if (!process.tgid && g_events.count > index) {
-                        PendingForkGroup *next = realloc(g_pending_fork_groups, (g_pending_fork_group_count + 1) * sizeof(*next));
-                        if (next) {
-                            g_pending_fork_groups = next;
-                            next[g_pending_fork_group_count++] = (PendingForkGroup){process.pid, index};
-                        } else fprintf(stderr, "FirehoseBackend could not retain pending fork group\n");
-                    }
-                } else if (bpf_event.event_type == TRACE_BPF_EVENT_EXIT) {
-                    process.ppid = process_parent_lookup(process.pid);
-                    pending_open_remove_pid(process.pid);
-                    fd_path_remove_pid(process.pid);
-                    process_parent_remove(process.pid);
-                    cmdline_process_name_cache_remove_pid(process.pid);
-                    snprintf(detail, sizeof(detail), "Exited %s", process.name);
-                    add_event("process.exit", &process, "", detail);
-                } else if (bpf_event.event_type == TRACE_BPF_EVENT_OPENAT) {
-                    process.ppid = process_parent_lookup(process.pid);
-                    snprintf(event_path, sizeof(event_path), "%s", bpf_event.text[0] ? bpf_event.text : "");
-                    pending_open_set(process.pid, bpf_event.tid, event_path);
-                    snprintf(detail, sizeof(detail), "dfd=%lld flags=0x%llx path=%s",
-                             (long long)bpf_event.arg0,
-                             (unsigned long long)bpf_event.arg1,
-                             bpf_event.text[0] ? bpf_event.text : "(unavailable)");
-                    add_event("file.openat", &process, event_path, detail);
-                } else if (bpf_event.event_type == TRACE_BPF_EVENT_OPENAT2) {
-                    process.ppid = process_parent_lookup(process.pid);
-                    snprintf(event_path, sizeof(event_path), "%s", bpf_event.text[0] ? bpf_event.text : "");
-                    pending_open_set(process.pid, bpf_event.tid, event_path);
-                    snprintf(detail, sizeof(detail), "dfd=%lld path=%s",
-                             (long long)bpf_event.arg0,
-                             bpf_event.text[0] ? bpf_event.text : "(unavailable)");
-                    add_event("file.openat2", &process, event_path, detail);
-                } else if (bpf_event.event_type == TRACE_BPF_EVENT_OPENAT_RET ||
-                           bpf_event.event_type == TRACE_BPF_EVENT_OPENAT2_RET) {
-                    int fd = (int64_t)bpf_event.arg0 >= 0 ? (int)bpf_event.arg0 : -1;
-                    if (pending_open_take(process.pid, bpf_event.tid, event_path, sizeof(event_path)) && fd >= 0) {
-                        fd_path_set(process.pid, fd, event_path);
-                    }
-                } else if (bpf_event.event_type == TRACE_BPF_EVENT_EXECVE) {
-                    process.ppid = process_parent_lookup(process.pid);
-                    snprintf(event_path, sizeof(event_path), "%s", bpf_event.text[0] ? bpf_event.text : "");
-                    snprintf(detail, sizeof(detail), "path=%s",
-                             bpf_event.text[0] ? bpf_event.text : "(unavailable)");
-                    add_event("process.execve", &process, event_path, detail);
-                    cmdline_process_name_cache_remove_pid(process.pid);
-                } else if (bpf_event.event_type == TRACE_BPF_EVENT_CLOSE) {
-                    process.ppid = process_parent_lookup(process.pid);
-                    int fd = (int)bpf_event.arg0;
-                    resolve_fd_path(process.pid, fd, event_path, sizeof(event_path));
-                    snprintf(detail, sizeof(detail), "fd=%llu", (unsigned long long)bpf_event.arg0);
-                    add_event("file.close", &process, event_path, detail);
-                    fd_path_remove(process.pid, fd);
-                } else if (bpf_event.event_type == TRACE_BPF_EVENT_READ) {
-                    process.ppid = process_parent_lookup(process.pid);
-                    int fd = (int)bpf_event.arg0;
-                    resolve_fd_path(process.pid, fd, event_path, sizeof(event_path));
-                    snprintf(detail, sizeof(detail), "fd=%llu count=%llu",
-                             (unsigned long long)bpf_event.arg0,
-                             (unsigned long long)bpf_event.arg1);
-                    add_event("file.read", &process, event_path, detail);
-                } else if (bpf_event.event_type == TRACE_BPF_EVENT_WRITE) {
-                    process.ppid = process_parent_lookup(process.pid);
-                    int fd = (int)bpf_event.arg0;
-                    resolve_fd_path(process.pid, fd, event_path, sizeof(event_path));
-                    if (process.pid == getpid() && fd == g_events.fd) {
-                        if (event_path[0] == '\0') {
-                            snprintf(event_path, sizeof(event_path), "%.*s",
-                                     (int)sizeof(event_path) - 1,
-                                     g_events.path);
-                        }
-                        if (!g_events.reported_recursive_write_ignore) {
-                            g_events.reported_recursive_write_ignore = true;
-                            snprintf(detail, sizeof(detail),
-                                     "fd=%llu count=%llu; Ignoring subsequent writes, to avoid recursive explosion",
-                                     (unsigned long long)bpf_event.arg0,
-                                     (unsigned long long)bpf_event.arg1);
-                            add_event("file.write", &process, event_path, detail);
-                        }
-                    } else {
-                        snprintf(detail, sizeof(detail), "fd=%llu count=%llu",
-                                 (unsigned long long)bpf_event.arg0,
-                                 (unsigned long long)bpf_event.arg1);
-                        add_event("file.write", &process, event_path, detail);
-                    }
-                }
+                consume_kernel_event(bpf_event, false);
             }
         } else if (header.type == PERF_RECORD_LOST) {
             uint64_t lost_count = 0;
@@ -1825,6 +1906,9 @@ static bool event_store_clear(EventStore *store) {
         return false;
     }
 #ifdef __linux__
+    free(g_namespace_forks);
+    g_namespace_forks = NULL;
+    g_namespace_fork_count = 0;
     free(g_pending_fork_groups);
     g_pending_fork_groups = NULL;
     g_pending_fork_group_count = 0;
@@ -1913,6 +1997,7 @@ static void add_event(const char *type, const ProcessInfo *process, const char *
     if (process) snprintf(event.group_name, sizeof(event.group_name), "%s", process->name);
 #endif
     event.container = container_host();
+    if (container_only()) { strcpy(event.container.id,"capture"); strcpy(event.container.name,"Capture"); }
     event.cgroup_id = process ? process->cgroup_id : 0;
 #ifdef __linux__
     if (event.cgroup_id) event.container = container_for_cgroup(event.cgroup_id);
@@ -3846,7 +3931,7 @@ static int create_listener(int port) {
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_addr.s_addr = htonl(container_only() ? INADDR_ANY : INADDR_LOOPBACK);
     addr.sin_port = htons((uint16_t)port);
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         perror("bind");
@@ -3954,6 +4039,9 @@ static void print_usage(const char *program) {
 }
 
 int main(int argc, char **argv) {
+#ifdef __linux__
+    if (argc == 2 && !strcmp(argv[1], "serve")) return tracing_serve(argv[0], "Firehose");
+#endif
     container_start();
     signal(SIGPIPE, SIG_IGN);
     struct sigaction action;
@@ -4020,7 +4108,18 @@ int main(int argc, char **argv) {
     bool using_ebpf = false;
     char ebpf_error[1024];
     ebpf_error[0] = '\0';
-    using_ebpf = start_ebpf_capture(&g_ebpf_capture, ebpf_error, sizeof(ebpf_error));
+    if (container_selected().id[0] && stat("/proc/self/ns/pid", &g_capture_pid_namespace)) {
+        perror("capture PID namespace");
+        return 1;
+    }
+    char fork_id[64];
+    if (!read_tracepoint_file("sched", "sched_process_fork", "id", fork_id, sizeof(fork_id))) {
+        snprintf(ebpf_error, sizeof(ebpf_error),
+                 "Linux tracepoints are unavailable. The container needs a tracing-enabled kernel "
+                 "(CONFIG_FTRACE, CONFIG_FTRACE_SYSCALLS) and access to tracefs.");
+    } else {
+        using_ebpf = start_ebpf_capture(&g_ebpf_capture, ebpf_error, sizeof(ebpf_error));
+    }
     if (!using_ebpf) {
         fprintf(stderr, "FirehoseBackend eBPF capture failed: %s\n", ebpf_error);
         stop_ebpf_capture(&g_ebpf_capture);
@@ -4029,6 +4128,14 @@ int main(int argc, char **argv) {
                  sizeof(g_capture_unsupported_message),
                  "Firehose cannot capture events on this machine because eBPF setup failed: %s",
                  ebpf_error);
+        if (!strncmp(container_selected().id, "apple.container:", 16)) {
+            size_t used = strlen(g_capture_unsupported_message);
+            snprintf(g_capture_unsupported_message + used, sizeof(g_capture_unsupported_message) - used,
+                     " Apple Container setup: build a kernel with Firehose.app/Contents/Resources/kernel/build.sh; "
+                     "create the container with --kernel PATH --cap-add BPF --cap-add PERFMON "
+                     "--cap-add SYS_ADMIN --cap-add IPC_LOCK. "
+                     "Open /help/apple-container in Firehose's HTML view for the complete guide.");
+        }
         ProcessInfo self = {.pid = 0, .ppid = 0};
         snprintf(self.name, sizeof(self.name), "firehose");
         add_event("capture.unsupported", &self, "", g_capture_unsupported_message);

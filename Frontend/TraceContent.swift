@@ -310,13 +310,18 @@ private func decodeTraceEventResponse(_ data: Data) throws -> TraceEventResponse
         let offset = headerSize + index * recordSize
         let pid = Int(try data.traceInt32(at: offset + 16))
         let ppid = Int(try data.traceInt32(at: offset + 20))
+        let processName = try data.traceStringRef32(at: offset + 40)
+        let containerName = recordSize >= 80 ? try data.traceStringRef32(at: offset + 64) : ""
+        let containerID = recordSize >= 80 ? try data.traceStringRef32(at: offset + 72) : "host"
+        let displayName = containerID == "host" || containerID == "capture" || containerName.isEmpty
+            ? processName : "\(processName) — \(containerName)"
         events.append(TraceEvent(id: try data.traceUInt64(at: offset + 0),
                                  timestamp: try data.traceDouble(at: offset + 8),
                                  time: try data.traceStringRef32(at: offset + 24),
                                  type: try data.traceStringRef32(at: offset + 32),
                                  pid: pid,
                                  ppid: ppid,
-                                 process: try data.traceStringRef32(at: offset + 40),
+                                 process: displayName,
                                  path: recordSize >= 64 ? try data.traceStringRef32(at: offset + 56) : "",
                                  detail: try data.traceStringRef32(at: offset + 48)))
     }
@@ -929,11 +934,14 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
 
     private func configureNetworking() {
         if let base = outerframeHost.pluginBaseURL() {
-            apiEndpoint = URL(string: "/api/events", relativeTo: base)?.absoluteURL
-            processTimelineEndpoint = URL(string: "/api/processes", relativeTo: base)?.absoluteURL
-            eventPositionEndpoint = URL(string: "/api/event-position", relativeTo: base)?.absoluteURL
-            captureEndpoint = URL(string: "/api/capture", relativeTo: base)?.absoluteURL
-            clearLogEndpoint = URL(string: "/api/clear", relativeTo: base)?.absoluteURL
+        let targetParts = (outerframeHost.pluginURL()?.path ?? "").split(separator: "/")
+        let targetPrefix = targetParts.count >= 2 && targetParts[0] == "targets" ? "/targets/\(targetParts[1])" : ""
+
+            apiEndpoint = URL(string: targetPrefix + "/api/events", relativeTo: base)?.absoluteURL
+            processTimelineEndpoint = URL(string: targetPrefix + "/api/processes", relativeTo: base)?.absoluteURL
+            eventPositionEndpoint = URL(string: targetPrefix + "/api/event-position", relativeTo: base)?.absoluteURL
+            captureEndpoint = URL(string: targetPrefix + "/api/capture", relativeTo: base)?.absoluteURL
+            clearLogEndpoint = URL(string: targetPrefix + "/api/clear", relativeTo: base)?.absoluteURL
         }
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 5
@@ -2837,6 +2845,9 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
 
     private func machineUnsupportedBodyText() -> String {
         let message = captureStorageStatus?.unsupportedMessage.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if message.contains("/help/apple-container") {
+            return "This Apple container needs tracing setup.\n\n" + message
+        }
         let isPermissionFailure = message.localizedCaseInsensitiveContains("permission denied") ||
             message.localizedCaseInsensitiveContains("operation not permitted")
         let intro: String

@@ -84,3 +84,49 @@ Discovery refreshes every five seconds. Events from cgroups not yet discovered a
 Run `python3 Scripts/test_container_events.py` for sanitizer-backed fork-path copying, event identity, binary encoding, and filtering checks.
 
 Linux capture uses task IDs consistently for fork, syscall, and exit events, while the timeline groups those events by the owning process ID (TGID). Worker-thread lifecycle events do not create separate process rows or end the owning process. Fork names are read at capture time from either fixed-length or `__data_loc` tracepoint fields, including for children that exit before userspace consumes the event. `Scripts/test_linux_task_capture.py /absolute/path/to/FirehoseBackend` tests this using a separate backend instance and requires root on Linux.
+
+## macOS container tracing
+
+The user app supports registered Docker and Apple Container targets. The Mac
+backend never traces macOS. The landing page chooses a runtime or an Apple
+container; target paths are retained in HTML and outerframe navigation.
+
+Docker uses an app-owned Linux worker with explicit tracing capabilities and
+access to the VM PID namespace. Only containers in Outer Shell's binary registry
+are eligible, and expired registry snapshots fail closed. No Docker socket is
+mounted in the worker. It starts on first use and stops with the Mac backend.
+
+Apple Container runs the app's own Linux helper inside the selected container.
+The helper stays alive while the backend uses it and exits when its stdin closes.
+Requests and responses use the existing binary app APIs in offset-based TRPC
+frames over `container exec --interactive`; there is no JSON helper protocol.
+The registry, rather than CLI container listings, supplies targets.
+
+Build and install with `./app deploy --local`. Xcode and either Docker or Apple
+Container are needed to build the Linux helper. Set
+`OUTER_BUILD_CONTAINER_RUNTIME=container|docker` to choose the builder. The app
+packages its helper under `Contents/Resources/helpers`, and Outer Shell's
+container bootstrap includes it in new base images. Existing images need their
+helper installed at `/usr/local/bin/outer-firehose-helper` and rebuilt.
+Docker worker images are built during installation when Docker is available, or
+on first Docker use otherwise.
+
+Apple Container 1.1.0's standard Linux 6.18.15 kernel has FTRACE disabled.
+Firehose now supplies a checksum-verified custom-kernel builder and an in-app
+setup guide at `/help/apple-container`. The unsupported-capture banner links to
+that guide; the native frontend includes setup instructions too. See
+[Kernel/README.md](Kernel/README.md) for the build and validation details.
+
+Live capture has been verified with the generated kernel and BPF, PERFMON,
+SYS_ADMIN and IPC_LOCK capabilities. Events use container-local process/task IDs,
+exclude the surrounding VM's tasks, and preserve short-lived child/thread events.
+Existing containers must be recreated with the kernel and capabilities; installing
+Firehose does not replace their kernels or change Apple's user-wide default.
+
+The runtime contract reserves `wslc` separately from WSL distributions (`wsl`).
+Windows process spawning and live tracing remain to be implemented and tested on
+Windows; the Mac implementation is not a Windows app.
+
+Run `python3 Scripts/test_macos_container_app.py` after installation to verify
+Docker APIs, host exclusion, HTML and favicon. The portable frame codec test is
+`cc -std=gnu17 Scripts/test_tracing_stream.c -o /tmp/test-stream && /tmp/test-stream`.

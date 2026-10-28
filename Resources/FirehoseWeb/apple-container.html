@@ -1,0 +1,26 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Set up Apple Container tracing — Firehose</title>
+<style>html{color-scheme:light dark}body{font:15px/1.6 system-ui;max-width:760px;margin:32px auto;padding:0 20px;background:Canvas;color:CanvasText}pre{padding:16px;background:color-mix(in srgb,CanvasText 7%,Canvas);border-radius:8px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}a{color:LinkText}h2{font-size:19px;margin-top:32px}code{font-size:.9em}</style>
+<a href="javascript:history.back()">← Back to Firehose</a>
+<h1>Trace an Apple container</h1>
+<p>Apple Container runs each container in its own Linux VM. Its standard kernel lacks the tracepoints Firehose needs. Use a tracing-enabled kernel for the specific container you want to inspect.</p>
+<h2>1. Build the kernel on your Mac</h2>
+<p>The installed Firehose app includes a builder. It uses Apple Container by default; set <code>OUTER_BUILD_CONTAINER_RUNTIME=docker</code> to build with Docker instead. Allow several minutes and several GB of free space.</p>
+<pre>"$HOME/Library/Application Support/outershell/apps/org.outershell.Firehose/Firehose.app/Contents/Resources/kernel/build.sh"</pre>
+<p>This builder targets Apple silicon and Linux 6.18.15. It checks the installed kernel version, reuses Apple's installed configuration, verifies the source archive checksum, and enables Linux event tracing. It does not change your default kernel or existing containers. It prints the finished kernel path.</p>
+<h2>2. Create a container with that kernel</h2>
+<p>Use your image and retain its required mounts, environment variables and published ports. For example:</p>
+<pre>container create --name my-traced-container \
+  --kernel "$HOME/Library/Application Support/org.outershell.Firehose/kernels/6.18.15-firehose/vmlinux-firehose" \
+  --cap-add BPF --cap-add PERFMON --cap-add SYS_ADMIN --cap-add IPC_LOCK \
+  YOUR_IMAGE
+container start my-traced-container</pre>
+<p>The capabilities allow Firehose to load BPF programs, attach perf events, lock the capture buffers in memory, and mount tracefs inside this container's VM. They do not grant macOS administrator access. The image must include <code>/usr/local/bin/outer-firehose-helper</code>; new Outer Shell base images include it. For other images, copy the matching helper from Firehose's <code>Contents/Resources/helpers</code> into the image.</p>
+<p>For an existing container, create a replacement with the same persistent storage and configuration. Keep the original until the replacement works; rebuilding a Dockerfile alone does not change an existing container's kernel.</p>
+<h2>3. Register it and open Firehose</h2>
+<p>Use <strong>Import container…</strong> in Outer Shell to register the new Apple container, then choose it on Firehose's landing page. Reload Firehose after changing the container setup.</p>
+<h2>Using a default kernel instead</h2>
+<p>Apple also supports <code>container system kernel set --binary PATH</code> for future containers. This changes the user-wide default, so the per-container <code>--kernel</code> option is preferable when only selected containers need tracing. Restore Apple's default with <code>container system kernel set --recommended</code>. Existing containers still need recreation with the chosen kernel and capabilities.</p>
+<p><a href="https://github.com/apple/containerization/tree/main/kernel">Apple's kernel build documentation</a></p>

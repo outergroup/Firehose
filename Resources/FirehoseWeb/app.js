@@ -1,6 +1,8 @@
 (() => {
   'use strict';
 
+  const appFetch = (path, options) => window.fetch((location.pathname.match(/^\/targets\/[^/]+/)?.[0] || '') + path, options);
+
   const $ = selector => document.querySelector(selector);
   const decoder = new TextDecoder();
   class EventHistory {
@@ -135,9 +137,30 @@
 
   function updateCaptureStatus(result) {
     state.paused = Boolean(result.flags & 1);
+    const unsupported = Boolean(result.flags & 8);
+    $('#capture').disabled = unsupported;
+    if (unsupported && !state.captureHelpLoaded) refreshCaptureHelp();
+    if (!unsupported) { $('#captureHelp').hidden = true; state.captureHelpLoaded = false; }
     $('#capture').classList.toggle('paused', state.paused);
     $('#capture').setAttribute('aria-label', state.paused ? 'Resume capture' : 'Pause capture');
     $('#summary').textContent = `${result.matched.toLocaleString()} matching of ${result.total.toLocaleString()} events (${result.total ? Math.round(result.matched / result.total * 100) : 100}%) — ${state.paused ? 'Tracing paused' : 'Tracing live'}`;
+  }
+
+  async function refreshCaptureHelp() {
+    state.captureHelpLoaded = true;
+    try {
+      const response = await appFetch('/api/capture');
+      if (!response.ok) throw Error(await response.text());
+      const buffer = await response.arrayBuffer(), view = new DataView(buffer);
+      if (buffer.byteLength < 48 || u32(view, 0) !== 0x43535254 || u16(view, 4) !== 1) throw Error('Invalid capture status');
+      if (!(u32(view, 8) & 8)) return;
+      $('#captureHelpMessage').textContent = stringAt(buffer, view, 40) || 'Event capture is unavailable.';
+      $('#kernelGuide').hidden = !location.pathname.startsWith('/targets/apple.container:');
+      $('#captureHelp').hidden = false;
+    } catch (error) {
+      state.captureHelpLoaded = false;
+      console.warn('Capture setup information unavailable', error);
+    }
   }
 
   function renderEvents(result) {
@@ -388,7 +411,7 @@
     const generation = eventGeneration;
     try {
       const query = state.history.query(logicalOffset, $('#eventRows').clientHeight);
-      const response = await fetch('/api/events?' + appendFilters(query), { signal: controller.signal });
+      const response = await appFetch('/api/events?' + appendFilters(query), { signal: controller.signal });
       if (!response.ok) throw Error(await response.text());
       const result = parseEvents(await response.arrayBuffer());
       if (controller.signal.aborted || generation !== eventGeneration) return;
@@ -492,7 +515,7 @@
     const generation = eventGeneration;
     try {
       const query = processQuery();
-      const response = await fetch('/api/processes?' + query);
+      const response = await appFetch('/api/processes?' + query);
       const buffer = await response.arrayBuffer();
       if (response.ok && generation === eventGeneration) {
         renderProcesses(parseProcesses(buffer), Number(query.get('start')));
@@ -590,13 +613,13 @@
   }
 
   $('#capture').onclick = async () => {
-    await fetch('/api/capture?paused=' + (state.paused ? '0' : '1'));
+    await appFetch('/api/capture?paused=' + (state.paused ? '0' : '1'));
     refresh();
   };
 
   $('#clear').onclick = async () => {
     if (!confirm('Clear all captured events?')) return;
-    await fetch('/api/clear');
+    await appFetch('/api/clear');
     state.clauses = [];
     hideContext();
     resetEvents();
@@ -605,13 +628,16 @@
   $('#container').onchange = resetEvents;
   async function refreshContainers() {
     try {
-      const response = await fetch('/api/containers');
+      const response = await appFetch('/api/containers');
       if (!response.ok) return;
       const buffer = await response.arrayBuffer(), view = new DataView(buffer);
       if (buffer.byteLength < 16 || u32(view, 0) !== 0x54585443 || u32(view, 4) !== 1 || u32(view, 8) !== buffer.byteLength) return;
       const count = u32(view, 12);
       if (count > (buffer.byteLength - 16) / 16) return;
       const picker = $('#container');
+      const hasHost = Array.from({length: count}, (_, i) => stringAt(buffer, view, 16 + i * 16)).includes('host');
+      picker.options[0].textContent = hasHost ? 'All containers and host' : 'All containers';
+      if (!hasHost) [...picker.options].find(option => option.value === 'host')?.remove();
       for (let i = 0; i < count; i++) {
         const id = stringAt(buffer, view, 16 + i * 16), name = stringAt(buffer, view, 24 + i * 16);
         const option = [...picker.options].find(option => option.value === id);

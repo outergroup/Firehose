@@ -1,6 +1,7 @@
 #ifndef CONTAINER_CONTEXT_H
 #define CONTAINER_CONTEXT_H
 #include <stdint.h>
+#include <time.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,10 +19,20 @@
 #include <fcntl.h>
 
 typedef struct {
-    char id[65];
+    char id[320];
     char name[128];
     int local_pid;
 } ContainerContext;
+static bool container_only(void) { return getenv("OUTER_CONTAINER_REGISTRY") != NULL || getenv("OUTER_TRACING_CONTEXT_ID") != NULL; }
+static ContainerContext container_selected(void) {
+    ContainerContext context={0};
+    const char *id=getenv("OUTER_TRACING_CONTEXT_ID"), *name=getenv("OUTER_TRACING_CONTEXT_NAME");
+    if(id && *id) {
+        snprintf(context.id,sizeof(context.id),"%s",id);
+        snprintf(context.name,sizeof(context.name),"%s",name && *name?name:id);
+    }
+    return context;
+}
 static ContainerContext container_host(void) {
     return (ContainerContext){.id="host", .name="Host"};
 }
@@ -60,7 +71,12 @@ static void container_registry(const char *path, ContainerContext *names, size_t
     setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout));
     unsigned char header[4], request[]={2,0,0,0,34,0};
     unsigned char *body=NULL;
-    if (connect(fd,(struct sockaddr *)&address,sizeof(address)) || send(fd,request,sizeof(request),MSG_NOSIGNAL)!=sizeof(request) || !container_exact(fd,header,4)) goto done;
+    const char *snapshot=getenv("OUTER_CONTAINER_REGISTRY");
+    if (snapshot) {
+        close(fd); fd=open(snapshot,O_RDONLY|O_CLOEXEC);
+        struct stat st;
+        if (fd<0 || fstat(fd,&st) || time(NULL)-st.st_mtime>15 || !container_exact(fd,header,4)) goto done;
+    } else if (connect(fd,(struct sockaddr *)&address,sizeof(address)) || send(fd,request,sizeof(request),MSG_NOSIGNAL)!=sizeof(request) || !container_exact(fd,header,4)) goto done;
     size_t size=container_u32(header);
     if (size<48 || size>16*1024*1024) goto done;
     body=malloc(size);
@@ -80,6 +96,7 @@ done:
 static ContainerContext container_path_context(const char *path, const ContainerContext *names, size_t count) {
     ContainerContext context=container_host();
     for (size_t i=0;i<count;i++) if (strstr(path,names[i].id)) return names[i];
+    if (container_only()) return context;
     for (const char *p=path;*p;p++) {
         size_t n=strspn(p,"0123456789abcdef");
         if (n==64) {
@@ -117,7 +134,7 @@ static void *container_worker(void *unused) {
         char path[256];
         snprintf(path,sizeof(path),"/run/user/%u/outershelld-api",(unsigned)geteuid());
         container_registry(override && *override ? override : geteuid()==0 ? "/run/outershelld-api" : path,names,&count);
-        if (geteuid()==0 && (!override || !*override || !strcmp(override,"/run/outershelld-api"))) {
+        if (!container_only() && geteuid()==0 && (!override || !*override || !strcmp(override,"/run/outershelld-api"))) {
             glob_t paths={0};
             if (!glob("/run/user/*/outershelld-api",0,NULL,&paths))
                 for (size_t i=0;i<paths.gl_pathc;i++) container_registry(paths.gl_pathv[i],names,&count);
@@ -139,6 +156,7 @@ static void container_start(void) {
     else pthread_detach(thread);
 }
 static ContainerContext container_for_cgroup(uint64_t id) {
+    ContainerContext selected=container_selected();if(selected.id[0]) return selected;
     ContainerContext result={0};
     snprintf(result.id,sizeof(result.id),"cgroup-%llu",(unsigned long long)id);
     snprintf(result.name,sizeof(result.name),"Unresolved cgroup %llu",(unsigned long long)id);
@@ -155,11 +173,13 @@ static void container_put32(unsigned char *p, uint32_t value) {
     for (int i=0;i<4;i++) p[i]=(unsigned char)(value>>(8*i));
 }
 static unsigned char *container_catalog(size_t *size) {
-    ContainerContext names[1025]; size_t count=1;
-    names[0]=container_host();
+    ContainerContext names[1025]; size_t count=container_only()?0:1;
+    ContainerContext selected=container_selected();
+    if(selected.id[0]) { names[0]=selected;count=1; }
+    if (count && !selected.id[0]) names[0]=container_host();
 #ifdef __linux__
     pthread_mutex_lock(&container_lock);
-    memcpy(names+1,container_names,container_name_count*sizeof(*names)); count+=container_name_count;
+    memcpy(names+count,container_names,container_name_count*sizeof(*names)); count+=container_name_count;
     pthread_mutex_unlock(&container_lock);
 #endif
     *size=16+count*16;

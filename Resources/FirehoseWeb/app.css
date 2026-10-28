@@ -371,3 +371,7 @@ button:active { background: color-mix(in srgb, var(--button) 72%, var(--text)); 
 .event-head > span, .event-row > span { padding-left: 8px; padding-right: 8px; }
 .event-head > span:first-child, .event-row > span:first-child { padding-left: 0; }
 @media (max-width: 950px) { .event-tid, .event-thread { display: none; } }
+
+header:has(#captureHelp:not([hidden])) { flex-wrap: wrap; }
+#captureHelp { flex: 1 0 100%; grid-column: 1 / -1; color: var(--text); line-height: 1.5; white-space: normal; user-select: text; }
+#captureHelp a { display: block; color: var(--selected); }
