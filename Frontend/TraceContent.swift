@@ -851,6 +851,9 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             guard !isMachineUnsupported else { return }
             _ = handleFilterUnmarkText()
 
+        case .windowActiveUpdate(let isActive):
+            if !isActive { filterInputController.breakUndoCoalescing() }
+
         case .textCommand(let command):
             guard !isMachineUnsupported else { return }
             _ = handleFilterTextCommand(command)
@@ -880,7 +883,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             outerframeHost.sendCopySelectedPasteboardResponse(requestID: requestID,
                                                               items: items)
             if filterInputController.isFocused, !items.isEmpty {
-                filterInputController.insertText("")
+                _ = filterInputController.cutSelectedTextContent()
             }
 
         case .editCommandValidationRequest(let requestID, let commands):
@@ -2223,6 +2226,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
 
     private func removeFilterClause(at index: Int) {
         guard index >= 0, index < filterClauses.count else { return }
+        filterInputController.resetUndoHistory()
         filterClauses.remove(at: index)
         activeFilterIndex = min(activeFilterIndex, max(filterClauses.count - 1, 0))
         syncFilterInputToActiveClause(moveCursorToEnd: true)
@@ -2503,7 +2507,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     private func syncFilterInputToActiveClause(moveCursorToEnd: Bool) {
         isSyncingFilterInput = true
         let value = activeFilterValue()
-        filterInputController.setText(value)
+        filterInputController.setText(value, historyKey: String(activeFilterIndex))
         filterInputController.focus()
         if moveCursorToEnd {
             filterInputController.setCursorPosition(value.count, modifySelection: false)
@@ -3126,7 +3130,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             for representation in item.representations {
                 if representation.typeIdentifier == NSPasteboard.PasteboardType.string.rawValue,
                    let stringValue = String(data: representation.data, encoding: .utf8) {
-                    filterInputController.insertText(stringValue)
+                    filterInputController.pasteText(stringValue)
                     return
                 }
 
@@ -3134,7 +3138,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                    let attributed = try? NSAttributedString(data: representation.data,
                                                             options: [.documentType: NSAttributedString.DocumentType.rtf],
                                                             documentAttributes: nil) {
-                    filterInputController.insertText(attributed.string)
+                    filterInputController.pasteText(attributed.string)
                     return
                 }
             }
