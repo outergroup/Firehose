@@ -42,6 +42,15 @@
 #ifndef BPF_FUNC_probe_read_user_str
 #define BPF_FUNC_probe_read_user_str 114
 #endif
+#ifndef BPF_FUNC_get_current_cgroup_id
+#define BPF_FUNC_get_current_cgroup_id 80
+#endif
+#ifndef BPF_FUNC_probe_read_kernel_str
+#define BPF_FUNC_probe_read_kernel_str 115
+#endif
+#ifndef BPF_FUNC_get_ns_current_pid_tgid
+#define BPF_FUNC_get_ns_current_pid_tgid 120
+#endif
 #endif
 
 #define READ_BUFFER_SIZE 8192
