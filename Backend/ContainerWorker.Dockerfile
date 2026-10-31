@@ -8,4 +8,4 @@ COPY --from=build /worker /usr/local/bin/worker
 COPY web /app/web
 COPY bundles /app/bundles
 ENV OUTER_CONTAINER_REGISTRY=/state/registry.bin
-CMD ["sh", "-c", "mount -t tracefs tracefs /sys/kernel/tracing && exec /usr/local/bin/worker --port 7356 --bundles-dir /app/bundles --web-root /app/web"]
+CMD ["sh", "-c", "mount -t tracefs tracefs /sys/kernel/tracing && mkdir -p /run/outer-tracing && exec /usr/local/bin/worker --socket-path /run/outer-tracing/worker.sock --bundles-dir /app/bundles --web-root /app/web"]
