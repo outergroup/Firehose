@@ -17,7 +17,7 @@
   --cap-add BPF --cap-add PERFMON --cap-add SYS_ADMIN --cap-add IPC_LOCK \
   YOUR_IMAGE
 container start my-traced-container</pre>
-<p>The capabilities allow Firehose to load BPF programs, attach perf events, lock the capture buffers in memory, and mount tracefs inside this container's VM. They do not grant macOS administrator access. The image must include <code>/usr/local/bin/outer-firehose-helper</code>; new Outer Shell base images include it. For other images, copy the matching helper from Firehose's <code>Contents/Resources/helpers</code> into the image.</p>
+<p>The capabilities allow Firehose to load BPF programs, attach perf events, lock the capture buffers in memory, and mount tracefs inside this container's VM. They do not grant macOS administrator access. Firehose copies its helper into the container the first time it captures there; the image needs <code>/bin/sh</code>.</p>
 <p>For an existing container, create a replacement with the same persistent storage and configuration. Keep the original until the replacement works; rebuilding a Dockerfile alone does not change an existing container's kernel.</p>
 <h2>3. Register it and open Firehose</h2>
 <p>Use <strong>Import container…</strong> in Outer Shell to register the new Apple container, then choose it on Firehose's landing page. Reload Firehose after changing the container setup.</p>
