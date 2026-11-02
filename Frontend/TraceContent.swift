@@ -700,7 +700,29 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         retainedSelf = self
     }
 
+    private func resetTextCaretBlink() {
+        let caretLayers: [CALayer] = [filterCaretLayer]
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for caret in caretLayers {
+            guard let animation = caret.animation(forKey: filterCaretBlinkAnimationKey)?.copy() as? CAAnimation else { continue }
+            caret.removeAnimation(forKey: filterCaretBlinkAnimationKey)
+            caret.opacity = 1
+            animation.beginTime = CACurrentMediaTime() + 0.55
+            caret.add(animation, forKey: filterCaretBlinkAnimationKey)
+        }
+        CATransaction.commit()
+    }
+
     func outerframeHost(_ host: OuterframeHost, didReceiveMessage message: BrowserToContentMessage) {
+        switch message {
+        case .keyDown, .textInput, .setMarkedText, .textCommand, .setCursorPosition,
+             .mouseDown, .mouseDragged, .pasteboardContentPasted, .pasteboardContentDropped,
+             .contextMenuItemSelected, .accessibilityActionAndSnapshot:
+            resetTextCaretBlink()
+        default:
+            break
+        }
         switch message {
         case .initializeContent(let arguments):
             outerframeHost.configure(url: arguments.url ?? "",
