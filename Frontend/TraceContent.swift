@@ -529,6 +529,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
         let bar: CALayer
     }
 
+    private lazy var elasticScrolling = ElasticScrollController(host: outerframeHost)
     private let outerframeHost: OuterframeHost
     private let appConnection: OuterframeAppConnection
     private var retainedSelf: TraceHandler?
@@ -759,25 +760,26 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             self.appearance = appearance
             updateColors()
 
-        case .scrollWheelEvent(let point, let delta, _, _, _, let hasPreciseScrollingDeltas):
+        case .scrollWheelEvent(let point, let delta, _, let phase, let momentumPhase, let hasPreciseScrollingDeltas):
             guard !isMachineUnsupported else { return }
             let multiplier = hasPreciseScrollingDeltas ? CGFloat(1) : rowHeight
-            if processTimelineRowsClipLayer.frame.contains(processTimelineLayer.convert(point, from: rootLayer)) {
-                processTimelineScrollOffset -= delta.y * multiplier
+            if elasticScrolling.isActive("timeline") || processTimelineRowsClipLayer.frame.contains(processTimelineLayer.convert(point, from: rootLayer)) {
+                processTimelineScrollOffset = elasticScrolling.scroll("timeline", by: -delta.y * multiplier, offset: processTimelineScrollOffset, maximum: maxProcessTimelineScrollOffset(), viewport: processTimelineRowsClipLayer.bounds.height, phase: phase, momentumPhase: momentumPhase, precise: hasPreciseScrollingDeltas, direction: 1) { [weak self] in self.map { [$0.processTimelineRowsClipLayer] } ?? [] }
                 clampProcessTimelineScrollOffset()
                 updateLayout()
                 updateHoveredProcessTimelineDot(at: point)
                 fetchProcessTimeline(force: false)
                 return
             }
-            guard rowsClipLayer.frame.contains(tableLayer.convert(point, from: rootLayer)) else { return }
-            scrollOffset -= delta.y * multiplier
+            guard elasticScrolling.isActive("rows") || rowsClipLayer.frame.contains(tableLayer.convert(point, from: rootLayer)) else { return }
+            scrollOffset = elasticScrolling.scroll("rows", by: -delta.y * multiplier, offset: scrollOffset, maximum: maxScrollOffset(), viewport: rowsClipLayer.bounds.height, phase: phase, momentumPhase: momentumPhase, precise: hasPreciseScrollingDeltas, direction: 1) { [weak self] in self.map { [$0.rowsClipLayer] } ?? [] }
             clampScrollOffset()
             recordScrollSample()
             updateLayout()
             fetchVisibleWindow(force: false)
 
         case .mouseDown(let point, let modifierFlags, let clickCount):
+            let point = elasticScrolling.finish(at: point, in: rootLayer)
             if isMachineUnsupported {
                 if modifierFlags.contains(.control) {
                     showMachineUnsupportedContextMenu(at: point)
@@ -844,6 +846,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
             handleContextMenuSelection(menuID: menuID, itemID: itemID)
 
         case .keyDown(let keyCode, let characters, let charactersIgnoringModifiers, let modifierFlags, _):
+            elasticScrolling.reset()
             if isMachineUnsupported {
                 handleMachineUnsupportedKeyDown(charactersIgnoringModifiers: charactersIgnoringModifiers,
                                                 modifierFlags: modifierFlags)
@@ -944,6 +947,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
                                                              snapshot: accessibilitySnapshot())
 
         case .shutdown:
+            elasticScrolling.reset()
             stopPolling()
             retainedSelf = nil
 
@@ -953,6 +957,7 @@ private final class TraceHandler: NSObject, OuterframeHostDelegate, SingleLineTe
     }
 
     func outerframeHostDidDisconnect(_ host: OuterframeHost) {
+        elasticScrolling.reset()
         stopPolling()
         retainedSelf = nil
     }
